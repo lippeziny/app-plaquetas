@@ -15,3 +15,12 @@ Foi adicionado `adm-zip` em `devDependencies` (`^0.5.16`). O workflow já execut
 - A compilação Android ainda não foi iniciada nessa execução.
 
 Esta alteração corrige a causa identificada no log. A compilação nativa precisa ser confirmada em uma nova execução do GitHub Actions.
+
+
+## v4.2 — correção da importação Excel no Android
+
+- Substituída a leitura Base64 de planilhas por `ExpoFile.bytes()` e `XLSX.read(..., { type: 'array', dense: true })`.
+- O parser deixou de transformar todas as abas em arrays ao mesmo tempo; agora converte somente a aba solicitada na prévia/importação.
+- Incluído teste comparando a leitura por bytes com a leitura Base64 usada no teste legado.
+- Incluída verificação para impedir regressão que volte a enviar a planilha como Base64 pela ponte nativa.
+- Incluído limite preventivo de 50 MB por arquivo e 250 mil linhas na aba selecionada, com orientação de otimização em vez de deixar o Android encerrar o app por OOM.

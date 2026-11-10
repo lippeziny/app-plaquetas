@@ -7,7 +7,24 @@ export type WorkbookPreview = {
   columns: { index: number; label: string }[];
   suggested: { codeColumn: number; nameColumn: number; quantityColumn: number };
 };
-export type ParsedWorkbook = { sheetNames: string[]; sheets: Record<string, string[][]> };
+export type ParsedWorkbook = { sheetNames: string[]; workbook?: XLSX.WorkBook; sheets?: Record<string, string[][]> };
+
+function workbookRows(workbook: ParsedWorkbook, sheetName: string): string[][] {
+  if (workbook.workbook) {
+    const worksheet = workbook.workbook.Sheets[sheetName];
+    if (!worksheet) throw new Error(`A aba "${sheetName}" não foi localizada na planilha.`);
+    const usedRange = worksheet['!ref'];
+    if (usedRange) {
+      const range = XLSX.utils.decode_range(usedRange);
+      if (range.e.r > 250000) throw new Error('A aba selecionada ultrapassa 250 mil linhas. Filtre ou divida a planilha antes de importar no celular.');
+    }
+    const rows = XLSX.utils.sheet_to_json<unknown[]>(worksheet, { header: 1, raw: false, defval: '' });
+    return rows.map(row => row.map(cellText));
+  }
+  const rows = workbook.sheets?.[sheetName];
+  if (!rows) throw new Error(`A aba "${sheetName}" não foi localizada na planilha.`);
+  return rows;
+}
 
 function cellText(value: unknown): string {
   if (value == null) return '';
@@ -29,22 +46,24 @@ function suggest(headers: string[], terms: string[], fallback: number): number {
   return index >= 0 ? index + 1 : fallback;
 }
 
+export function parseWorkbookBytes(bytes: Uint8Array): ParsedWorkbook {
+  if (!bytes?.byteLength) throw new Error('O arquivo Excel está vazio ou não pôde ser lido.');
+  // Lê bytes diretamente, evitando uma string Base64 que duplica o consumo de memória.
+  const workbook = XLSX.read(bytes, { type: 'array', cellDates: true, dense: true });
+  if (!workbook.SheetNames?.length) throw new Error('Nenhuma aba foi encontrada no arquivo Excel.');
+  // Mantém o workbook e converte somente a aba selecionada pelo usuário.
+  return { sheetNames: [...workbook.SheetNames], workbook };
+}
+
 export function parseWorkbookBase64(base64: string): ParsedWorkbook {
   if (!base64) throw new Error('O arquivo Excel está vazio ou não pôde ser lido.');
-  const workbook = XLSX.read(base64, { type: 'base64', cellDates: true, dense: false });
+  const workbook = XLSX.read(base64, { type: 'base64', cellDates: true, dense: true });
   if (!workbook.SheetNames?.length) throw new Error('Nenhuma aba foi encontrada no arquivo Excel.');
-  const sheets: Record<string, string[][]> = {};
-  for (const name of workbook.SheetNames) {
-    const worksheet = workbook.Sheets[name];
-    const rows = XLSX.utils.sheet_to_json<unknown[]>(worksheet, { header: 1, raw: false, defval: '' });
-    sheets[name] = rows.map(row => row.map(cellText));
-  }
-  return { sheetNames: [...workbook.SheetNames], sheets };
+  return { sheetNames: [...workbook.SheetNames], workbook };
 }
 
 export function previewWorkbookSheet(workbook: ParsedWorkbook, sheetName: string, limit = 5): WorkbookPreview {
-  const rows = workbook.sheets[sheetName];
-  if (!rows) throw new Error(`A aba "${sheetName}" não foi localizada na planilha.`);
+  const rows = workbookRows(workbook, sheetName);
   const headers = (rows[0] || []).map((value, index) => value || `Coluna ${index + 1}`);
   const sample = rows.slice(1).filter(row => row.some(Boolean)).slice(0, limit);
   return {
@@ -65,8 +84,7 @@ export function importWorkbookSheet(
   mapping: { codeColumn: number; nameColumn: number; quantityColumn: number },
   sourceFile: string,
 ): { items: CatalogItem[]; skipped: number } {
-  const rows = workbook.sheets[sheetName];
-  if (!rows) throw new Error(`A aba "${sheetName}" não foi localizada na planilha.`);
+  const rows = workbookRows(workbook, sheetName);
   const codeIndex = Number(mapping.codeColumn) - 1;
   const nameIndex = Number(mapping.nameColumn) - 1;
   const quantityIndex = Number(mapping.quantityColumn) - 1;

@@ -16,13 +16,14 @@ import { Picker } from '@react-native-picker/picker';
 import * as DocumentPicker from 'expo-document-picker';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as FileSystem from 'expo-file-system/legacy';
+import { File as ExpoFile } from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 import { Asset } from 'expo-asset';
 import * as Print from 'expo-print';
 import { applyTemplateFieldMapping, buildPptx, type SlidePositionSettings, type TemplateVisual } from './offline/pptx';
 import TemplatePreview from './offline/TemplatePreview';
 import { buildLabelsPdfHtml } from './offline/pdf';
-import { importWorkbookSheet, normalizeSearch, parseWorkbookBase64, previewWorkbookSheet, type ParsedWorkbook } from './offline/workbook';
+import { importWorkbookSheet, normalizeSearch, parseWorkbookBytes, previewWorkbookSheet, type ParsedWorkbook } from './offline/workbook';
 import { EMPTY_LOCAL_DATA, readLocalData, writeLocalData, type StoredAppData } from './offline/storage';
 import { Ionicons } from '@expo/vector-icons';
 
@@ -86,11 +87,14 @@ function bytesToBase64(bytes: Uint8Array): string {
   }
   return output;
 }
-async function readPickedFileBase64(asset: any): Promise<string> {
+async function readPickedFileBytes(asset: any): Promise<Uint8Array> {
   if (Platform.OS === 'web' && asset.file?.arrayBuffer) {
-    return bytesToBase64(new Uint8Array(await asset.file.arrayBuffer()));
+    return new Uint8Array(await asset.file.arrayBuffer());
   }
-  return FileSystem.readAsStringAsync(asset.uri, { encoding: FileSystem.EncodingType.Base64 });
+  // Expo File.bytes() retorna Uint8Array sem criar uma string Base64 gigante
+  // pela ponte nativa do Android.
+  const file = new ExpoFile(asset.uri);
+  return await file.bytes();
 }
 async function readTemplateAssetBase64(): Promise<string> {
   const asset = Asset.fromModule(DEFAULT_TEMPLATE_ASSET);
@@ -330,9 +334,14 @@ function AppScreen() {
     try {
       const asset = await chooseFile('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       if (!asset) return;
+      const fileSize = Number(asset.size || 0);
+      const maxImportBytes = 50 * 1024 * 1024;
+      if (fileSize > maxImportBytes) {
+        return showMessage(`Esta planilha tem ${(fileSize / 1024 / 1024).toFixed(1)} MB. Para evitar falta de memória no celular, reduza o arquivo para até 50 MB: mantenha apenas as abas necessárias e remova imagens/objetos incorporados. Depois tente novamente.`);
+      }
       setBusy('Lendo planilha no aparelho...');
-      const base64 = await readPickedFileBase64(asset);
-      const parsed = parseWorkbookBase64(base64);
+      const bytes = await readPickedFileBytes(asset);
+      const parsed = parseWorkbookBytes(bytes);
       setWorkbookData(parsed);
       setDatabaseFile(asset.name || 'planilha.xlsx');
       setSheetNames(parsed.sheetNames);

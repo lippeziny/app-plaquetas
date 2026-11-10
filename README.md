@@ -57,3 +57,8 @@ npm start
 ## Rede e privacidade
 
 A interface mobile não contém chamadas a uma API e não usa URL de backend. O manifesto Android bloqueia as permissões `INTERNET` e `ACCESS_NETWORK_STATE`. Planilhas, códigos, nomes, contagens e modelos são processados no aparelho. A câmera só é solicitada quando o usuário abre o leitor.
+
+
+## Importação de planilhas grandes (v4.2)
+
+A importação Excel no Android lê o arquivo como `Uint8Array` usando `File.bytes()` do Expo FileSystem, em vez de converter o arquivo completo para Base64 pela ponte nativa. O parser usa `dense: true` e mantém o workbook em memória, convertendo para linhas somente a aba selecionada pelo usuário. Para evitar encerramento por falta de memória, o seletor orienta reduzir arquivos acima de 50 MB e abas acima de 250 mil linhas. Isso reduz cópias e consumo de memória durante a leitura.

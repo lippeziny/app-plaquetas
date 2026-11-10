@@ -113,6 +113,10 @@ test('imports Excel locally and suggests code, description and quantity columns'
   XLSX.utils.book_append_sheet(workbook, sheet, 'ESTOQUE SAP');
   const base64 = XLSX.write(workbook, { bookType: 'xlsx', type: 'base64' });
   const parsed = workbookTools.parseWorkbookBase64(base64);
+  const byteParsed = workbookTools.parseWorkbookBytes(Buffer.from(base64, 'base64'));
+  assert.deepEqual(byteParsed.sheetNames, parsed.sheetNames, 'byte-based import should discover the same sheets');
+  const bytePreview = workbookTools.previewWorkbookSheet(byteParsed, 'ESTOQUE SAP');
+  assert.equal(bytePreview.rows[0][1], 'MOTOR ELÉTRICO');
   const preview = workbookTools.previewWorkbookSheet(parsed, 'ESTOQUE SAP');
   assert.equal(preview.suggested.codeColumn, 1);
   assert.equal(preview.suggested.nameColumn, 2);
@@ -142,6 +146,10 @@ test('mobile app contains no backend API calls and blocks Android network permis
   const config = JSON.parse(fs.readFileSync(path.join(root, 'app.json'), 'utf8'));
   assert.doesNotMatch(app, /EXPO_PUBLIC_API_URL|\/api\//);
   assert.match(app, /OFFLINE/);
+  assert.match(app, /readPickedFileBytes/);
+  assert.match(app, /maxImportBytes/);
+  assert.match(app, /50 MB/);
+  assert.doesNotMatch(app, /readPickedFileBase64\(asset\)/, 'Excel import must not cross the native bridge as Base64 text');
   assert.ok(config.expo.android.blockedPermissions.includes('android.permission.INTERNET'));
   assert.ok(config.expo.android.blockedPermissions.includes('android.permission.ACCESS_NETWORK_STATE'));
 });
