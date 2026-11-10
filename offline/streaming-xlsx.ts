@@ -1,4 +1,4 @@
-import { File as ExpoFile, FileMode } from 'expo-file-system';
+import { File as ExpoFile } from 'expo-file-system';
 import * as FileSystem from 'expo-file-system/legacy';
 import { Utf8StreamDecoder } from './utf8-stream';
 import {
@@ -67,7 +67,7 @@ async function* xmlChunks(
   onBytesRead?: (bytesRead: number, totalBytes: number) => void,
 ): AsyncGenerator<string> {
   const file = new ExpoFile(uri);
-  const handle = file.open(FileMode.ReadOnly);
+  const handle = file.open();
   const decoder = new Utf8StreamDecoder();
   let bytesRead = 0;
   const totalBytes = Number(handle.size ?? file.size ?? 0);

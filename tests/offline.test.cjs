@@ -231,6 +231,9 @@ test('mobile app contains no backend API calls and blocks Android network permis
   assert.match(app, /setInterval\(\(\) =>/ , 'elapsed time and ETA must refresh while a long import stage is processing');
   assert.doesNotMatch(app, /readPickedFileBase64\(asset\)/, 'Excel import must not cross the native bridge as Base64 text');
   const importer = fs.readFileSync(path.join(root, 'offline', 'streaming-xlsx.ts'), 'utf8');
+  assert.match(importer, /import \{ File as ExpoFile \} from 'expo-file-system';/, 'use the Expo SDK 54 File export');
+  assert.match(importer, /const handle = file\.open\(\);/, 'SDK 54 File.open takes no mode argument');
+  assert.doesNotMatch(importer, /FileMode|file\.open\(\s*[^)]/, 'do not use FileMode or pass arguments to File.open in the pinned SDK');
   assert.match(importer, /suggested: \{ codeColumn: 1, nameColumn: 2, quantityColumn: 4 \}/, 'stock import defaults to A/B/D');
   assert.match(importer, /getNeededSharedStringIds/);
   const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));

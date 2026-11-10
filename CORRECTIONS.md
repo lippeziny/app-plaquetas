@@ -53,3 +53,11 @@ O fluxo de importação do modelo personalizado ainda chamava a função removid
 - Linhas completamente vazias nas colunas selecionadas não são armazenadas em staging. Os lotes de gravação da planilha foram ampliados para até 1.000 linhas e os lotes da etapa de consolidação para 2.000 linhas, reduzindo transações frequentes sem aumentar significativamente o pico de memória.
 - Tempo decorrido e ETA são atualizados a cada segundo, inclusive durante etapas longas sem callback de progresso. O cursor de IDs também verifica o cancelamento periodicamente.
 - O mapeamento inicial segue A = código, B = nome e D = quantidade; o usuário ainda pode ajustar as colunas na tela.
+
+
+## v4.3.1 — Expo FileSystem SDK 54 API compatibility
+
+- Removed the unsupported `FileMode` import from `expo-file-system`.
+- Changed `File.open(FileMode.ReadOnly)` to `File.open()` as required by the project’s pinned Expo FileSystem typings.
+- Kept incremental 256 KB `readBytes` reads and the UTF-8 streaming decoder unchanged.
+- Added a regression assertion to the offline test suite so the unsupported call is not reintroduced.

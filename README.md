@@ -84,3 +84,8 @@ A importação de modelos PowerPoint personalizados também lê o arquivo como b
 - Preservação de códigos com zeros à esquerda em formatos numéricos simples.
 - Tela de progresso com etapa, percentual, linhas lidas, duração atualizada a cada segundo, média de linhas por segundo, ETA suavizada e cancelamento.
 - Sem limite fixo de 50 MB; o teto prático é limitado pelo espaço de armazenamento e capacidade do dispositivo.
+
+
+### Build note for v4.3.1
+
+The streaming XLSX reader uses the Expo SDK 54 `File.open()` signature with no mode argument. It continues reading the extracted XML in 256 KB chunks using `FileHandle.readBytes(length)`.
