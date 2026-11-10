@@ -1,0 +1,16 @@
+name: Deploy web and API to Render
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+    steps:
+      - name: Trigger Render deploy hook
+        if: env.HOOK != ''
+        run: curl --fail --silent --show-error -X POST "$HOOK"

@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: plaquetas-by-lippe
+    runtime: docker
+    plan: starter
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 4000
+      - key: DATABASE_PATH
+        value: /var/data/plaquetas.sqlite
+      - key: APP_DATA_DIR
+        value: /var/data
+      - key: EXPO_PUBLIC_API_URL
+        value: https://plaquetas-by-lippe.onrender.com
+    disk:
+      name: plaquetas-data
+      mountPath: /var/data
+      sizeGB: 1
