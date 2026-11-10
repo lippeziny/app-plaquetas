@@ -147,6 +147,7 @@ test('mobile app contains no backend API calls and blocks Android network permis
   assert.doesNotMatch(app, /EXPO_PUBLIC_API_URL|\/api\//);
   assert.match(app, /OFFLINE/);
   assert.match(app, /readPickedFileBytes/);
+  assert.match(app, /bytesToBase64\(await readPickedFileBytes\(asset\)\)/, 'custom PowerPoint templates must use the byte reader before Base64 encoding');
   assert.match(app, /maxImportBytes/);
   assert.match(app, /50 MB/);
   assert.doesNotMatch(app, /readPickedFileBase64\(asset\)/, 'Excel import must not cross the native bridge as Base64 text');

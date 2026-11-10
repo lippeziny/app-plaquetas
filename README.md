@@ -62,3 +62,8 @@ A interface mobile não contém chamadas a uma API e não usa URL de backend. O 
 ## Importação de planilhas grandes (v4.2)
 
 A importação Excel no Android lê o arquivo como `Uint8Array` usando `File.bytes()` do Expo FileSystem, em vez de converter o arquivo completo para Base64 pela ponte nativa. O parser usa `dense: true` e mantém o workbook em memória, convertendo para linhas somente a aba selecionada pelo usuário. Para evitar encerramento por falta de memória, o seletor orienta reduzir arquivos acima de 50 MB e abas acima de 250 mil linhas. Isso reduz cópias e consumo de memória durante a leitura.
+
+
+### Correção v4.2.1
+
+A importação de modelos PowerPoint personalizados também lê o arquivo como bytes (`ExpoFile.bytes()`) e só converte para Base64 para o processamento interno do PPTX. Isso elimina a chamada obsoleta `readPickedFileBase64` que causava erro de TypeScript.

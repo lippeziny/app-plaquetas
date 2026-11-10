@@ -24,3 +24,8 @@ Esta alteração corrige a causa identificada no log. A compilação nativa prec
 - Incluído teste comparando a leitura por bytes com a leitura Base64 usada no teste legado.
 - Incluída verificação para impedir regressão que volte a enviar a planilha como Base64 pela ponte nativa.
 - Incluído limite preventivo de 50 MB por arquivo e 250 mil linhas na aba selecionada, com orientação de otimização em vez de deixar o Android encerrar o app por OOM.
+
+
+## v4.2.1 — correção da importação de modelo PowerPoint
+
+O fluxo de importação do modelo personalizado ainda chamava a função removida `readPickedFileBase64`. A chamada foi alinhada ao leitor binário atual: `bytesToBase64(await readPickedFileBytes(asset))`. Foi incluída uma asserção de regressão para exigir esse caminho e impedir referências à função antiga.

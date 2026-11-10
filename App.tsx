@@ -380,7 +380,7 @@ function AppScreen() {
       const asset = await chooseFile('application/vnd.openxmlformats-officedocument.presentationml.presentation');
       if (!asset) return;
       setBusy('Analisando modelo PowerPoint localmente...');
-      const base64 = await readPickedFileBase64(asset);
+      const base64 = bytesToBase64(await readPickedFileBytes(asset));
       const { inspectPptx } = await import('./offline/pptx');
       const result = await inspectPptx(base64, asset.name || 'Modelo personalizado.pptx');
       const savedTemplate = await persistPickedTemplate(asset, base64, asset.name || 'Modelo personalizado.pptx');
