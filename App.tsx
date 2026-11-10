@@ -37,7 +37,7 @@ type ExportResult = { fileName: string; format: string; downloadUrl: string; pag
 
 const ENV_API = process.env.EXPO_PUBLIC_API_URL || '';
 const WEB_LOCALHOST = Platform.OS === 'web' && typeof window !== 'undefined' && ['localhost', '127.0.0.1'].includes(window.location.hostname);
-const DEFAULT_API = ENV_API || (Platform.OS === 'web' ? (WEB_LOCALHOST ? 'http://localhost:4000' : '') : Platform.OS === 'android' ? 'http://10.0.2.2:4000' : 'http://127.0.0.1:4000');
+const DEFAULT_API = ENV_API || (Platform.OS === 'web' ? (WEB_LOCALHOST ? 'http://localhost:4000' : '') : 'https://plaquetas-by-lippe.onrender.com');
 const GREEN = '#17734F';
 const INK = '#17251F';
 const MUTED = '#75827B';
@@ -54,6 +54,7 @@ function makeId() { return `${Date.now()}-${Math.random().toString(36).slice(2, 
 function splitValues(text: string) { return text.split(/[\n,;\t]+/).map(v => v.trim()).filter(Boolean); }
 
 async function fetchJson<T>(base: string, endpoint: string, options?: RequestInit): Promise<T> {
+  if (!base.trim() && Platform.OS !== 'web') throw new Error('Configure o endereço HTTPS do servidor nas configurações do aplicativo.');
   const response = await fetch(`${base.replace(/\/$/, '')}${endpoint}`, options);
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(payload.error || `Falha na comunicação (${response.status}).`);
@@ -89,7 +90,25 @@ function Card({ children, style }: { children: React.ReactNode; style?: any }) {
   return <View style={[styles.card, style]}>{children}</View>;
 }
 
-export default function App() {
+function CameraScanner({ onScan, onClose }: { onScan: (data: string) => void; onClose: () => void }) {
+  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+  return (
+    <View style={styles.cameraContainer}>
+      {!cameraPermission?.granted ? (
+        <View style={styles.cameraPermission}>
+          <Ionicons name="camera-outline" size={28} color={GREEN} />
+          <Text style={styles.helper}>A câmera precisa de permissão.</Text>
+          <ActionButton title="Permitir câmera" onPress={async () => { const result = await requestCameraPermission(); if (!result.granted) showMessage('A permissão da câmera não foi concedida.'); }} />
+        </View>
+      ) : (
+        <CameraView style={styles.camera} facing="back" onBarcodeScanned={({ data }) => onScan(data)} barcodeScannerSettings={{ barcodeTypes: ['qr', 'ean13', 'ean8', 'code128', 'code39', 'upc_a', 'upc_e'] }} />
+      )}
+      <ActionButton title="Fechar leitor" onPress={onClose} secondary small />
+    </View>
+  );
+}
+
+function AppScreen() {
   const { width } = useWindowDimensions();
   const [apiUrl, setApiUrl] = useState(DEFAULT_API);
   const [apiEdit, setApiEdit] = useState(DEFAULT_API);
@@ -128,7 +147,6 @@ export default function App() {
   const [scanName, setScanName] = useState('');
   const [scanStep, setScanStep] = useState<1 | 10>(1);
   const [counts, setCounts] = useState<CatalogItem[]>([]);
-  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const lastScan = useRef({ code: '', at: 0 });
 
   const selectedSlide = template?.slides?.[templateSlide] || template?.slides?.[0];
@@ -147,11 +165,19 @@ export default function App() {
 
   useEffect(() => {
     let alive = true;
+    if (!apiUrl.trim()) {
+      setApiReady(false);
+      setTemplate(null);
+      setDatabase({ total: 0, sheetName: '', sourceFile: '', ready: false });
+      return () => { alive = false; };
+    }
     (async () => {
       try {
         await fetchJson(apiUrl, '/api/health');
-        const info = await fetchJson<TemplateInfo>(apiUrl, '/api/templates/default');
-        const status = await fetchJson<any>(apiUrl, '/api/database/status');
+        const [info, status] = await Promise.all([
+          fetchJson<TemplateInfo>(apiUrl, '/api/templates/default'),
+          fetchJson<any>(apiUrl, '/api/database/status')
+        ]);
         if (!alive) return;
         setApiReady(true);
         setTemplate(info);
@@ -342,6 +368,7 @@ export default function App() {
   const openSettings = () => setSettingsOpen(value => !value);
   const applyApi = async () => {
     const value = apiEdit.trim().replace(/\/$/, '');
+    if (value && !/^https?:\/\//i.test(value)) return showMessage('Informe uma URL começando com https:// ou http://.');
     setApiUrl(value);
     setSettingsOpen(false);
   };
@@ -362,9 +389,9 @@ export default function App() {
 
     {settingsOpen && <View style={styles.settingsPanel}>
       <Text style={styles.settingsTitle}>Conexão com o servidor</Text>
-      <TextInput value={apiEdit} onChangeText={setApiEdit} placeholder="https://seu-backend.onrender.com" autoCapitalize="none" style={styles.textInput} />
+      <TextInput value={apiEdit} onChangeText={setApiEdit} placeholder="https://plaquetas-by-lippe.onrender.com" autoCapitalize="none" autoCorrect={false} keyboardType="url" style={styles.textInput} />
       <View style={styles.rowActions}><ActionButton title="Aplicar URL" onPress={applyApi} small /><ActionButton title="Fechar" onPress={openSettings} secondary small /></View>
-      <Text style={styles.helper}>No site publicado, deixe a URL padrão. No app instalado, informe o endereço do servidor publicado.</Text>
+      <Text style={styles.helper}>Use a URL HTTPS pública do serviço no Render. O endereço padrão já aponta para o serviço configurado neste projeto.</Text>
     </View>}
 
     <View style={styles.tabBar}>
@@ -381,7 +408,7 @@ export default function App() {
 
     {!apiReady && <View style={styles.apiWarning}>
       <Ionicons name="cloud-offline-outline" size={20} color="#A45B18" />
-      <View style={{ flex: 1 }}><Text style={styles.apiWarningTitle}>Servidor não conectado</Text><Text style={styles.apiWarningText}>Confira a URL nas configurações e verifique se o backend está ativo.</Text></View>
+      <View style={{ flex: 1 }}><Text style={styles.apiWarningTitle}>Servidor não conectado</Text><Text style={styles.apiWarningText}>A interface abriu, mas a base, os modelos e as exportações dependem do servidor. Confira a URL HTTPS nas configurações.</Text></View>
       <ActionButton title="Configurar" onPress={() => setSettingsOpen(true)} secondary small />
     </View>}
 
@@ -541,10 +568,7 @@ export default function App() {
         <View style={[styles.leftColumn, width < 960 && styles.columnMobile]}>
           <Card>
             <SectionTitle eyebrow="LEITOR" title="Identificar item" subtitle="Use a câmera para ler QR Code/código de barras ou digite o código." />
-            {scanEnabled ? <View style={styles.cameraContainer}>
-              {!cameraPermission?.granted ? <View style={styles.cameraPermission}><Ionicons name="camera-outline" size={28} color={GREEN} /><Text style={styles.helper}>A câmera precisa de permissão.</Text><ActionButton title="Permitir câmera" onPress={requestCameraPermission} /></View> : <CameraView style={styles.camera} facing="back" onBarcodeScanned={({ data }) => onScan(data)} barcodeScannerSettings={{ barcodeTypes: ['qr', 'ean13', 'ean8', 'code128', 'code39', 'upc_a', 'upc_e'] }} />}
-              <ActionButton title="Fechar leitor" onPress={() => setScanEnabled(false)} secondary small />
-            </View> : <ActionButton title="Abrir câmera" onPress={async () => { if (!cameraPermission?.granted) { const p = await requestCameraPermission(); if (!p.granted) return; } setScanEnabled(true); }} icon="camera-outline" />}
+            {scanEnabled ? <CameraScanner onScan={onScan} onClose={() => setScanEnabled(false)} /> : <ActionButton title="Abrir câmera" onPress={() => setScanEnabled(true)} icon="camera-outline" />}
             <Text style={styles.fieldLabel}>Código do item</Text><TextInput value={scanCode} onChangeText={setScanCode} placeholder="Escaneie ou digite o código" style={styles.textInput} autoCapitalize="none" />
             {!!scanName && <Text style={styles.scanName}>{scanName}</Text>}
             <Text style={styles.fieldLabel}>Tamanho da contagem</Text><View style={styles.stepChoices}><Pressable onPress={() => setScanStep(1)} style={[styles.stepChoice, scanStep === 1 && styles.stepChoiceActive]}><Text style={[styles.stepChoiceText, scanStep === 1 && styles.stepChoiceTextActive]}>+1 unidade</Text></Pressable><Pressable onPress={() => setScanStep(10)} style={[styles.stepChoice, scanStep === 10 && styles.stepChoiceActive]}><Text style={[styles.stepChoiceText, scanStep === 10 && styles.stepChoiceTextActive]}>+10 unidades</Text></Pressable></View>
@@ -564,6 +588,38 @@ export default function App() {
 
     {!!busy && <View style={styles.busyOverlay}><View style={styles.busyCard}><ActivityIndicator color={GREEN} size="small" /><Text style={styles.busyText}>{busy}</Text></View></View>}
   </View>;
+}
+
+class AppErrorBoundary extends React.Component<React.PropsWithChildren, { error: string | null }> {
+  state = { error: null as string | null };
+
+  static getDerivedStateFromError(error: unknown) {
+    const message = error instanceof Error ? error.message : String(error || 'Erro inesperado');
+    return { error: message };
+  }
+
+  componentDidCatch(error: Error, info: React.ErrorInfo) {
+    console.error('Falha ao renderizar o Plaquetas:', error, info.componentStack);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <View style={{ flex: 1, backgroundColor: '#F4F7F4', justifyContent: 'center', padding: 24 }}>
+          <Text style={{ color: '#17251F', fontSize: 22, fontWeight: '900', marginBottom: 10 }}>O Plaquetas encontrou um erro</Text>
+          <Text style={{ color: '#53645B', fontSize: 14, lineHeight: 21, marginBottom: 18 }}>{this.state.error}</Text>
+          <Pressable onPress={() => this.setState({ error: null })} style={{ backgroundColor: '#17734F', borderRadius: 10, padding: 14, alignItems: 'center' }}>
+            <Text style={{ color: '#FFFFFF', fontWeight: '800' }}>Tentar abrir novamente</Text>
+          </Pressable>
+        </View>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+export default function App() {
+  return <AppErrorBoundary><AppScreen /></AppErrorBoundary>;
 }
 
 const styles = StyleSheet.create({

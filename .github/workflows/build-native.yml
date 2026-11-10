@@ -5,87 +5,143 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
+# Keep the Android toolchain on Java 17: Expo SDK 54 / its Gradle plugins
+# are built with the JDK 17 toolchain. Node 22 is used for Expo CLI.
+env:
+  CI: '1'
+  EXPO_PUBLIC_API_URL: ${{ vars.API_URL || 'https://plaquetas-by-lippe.onrender.com' }}
+
 jobs:
   android:
-    name: Android APK
-    runs-on: ubuntu-latest
-    env:
-      EXPO_PUBLIC_API_URL: ${{ vars.API_URL }}
+    name: Android APK (physical devices)
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-      - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
         with:
-          node-version: 22
-      # Gradle 8.14.3 cannot run on Java 25 (class-file version 69).
-      # Pin the Android build runner to JDK 17 for a stable AGP 8.x toolchain.
+          node-version: '22'
+          package-manager-cache: false
+
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
-          architecture: x64
-      - name: Verify Java and Gradle runtime
+
+      - name: Show build tool versions
         run: |
+          node --version
+          npm --version
           java -version
-          echo "JAVA_HOME=$JAVA_HOME"
-      - name: Install dependencies
-        run: npm install
-      - name: Generate native Android project
-        run: npx expo prebuild --platform android --non-interactive
-      - name: Build APK
+
+      # There is intentionally no npm cache here: this repository does not
+      # include a package-lock.json yet, so setup-node's npm cache cannot work.
+      - name: Install JavaScript dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Check Expo dependency alignment
+        run: npx expo install --check
+
+      - name: Run project tests
+        run: npm test
+
+      - name: Generate a clean Android project
+        run: npx expo prebuild --clean --platform android
+
+      - name: Build release APK
         working-directory: android
         run: |
           chmod +x gradlew
-          ./gradlew assembleRelease
+          ./gradlew --version
+          ./gradlew clean :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Verify APK exists
+        run: test -s android/app/build/outputs/apk/release/app-release.apk
+
       - name: Upload Android APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: plaquetas-android-apk
           path: android/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
+          retention-days: 14
 
   ios-simulator:
-    name: iOS Simulator app (unsigned)
+    name: iOS Simulator app (not for physical iPhone)
     runs-on: macos-15
-    env:
-      EXPO_PUBLIC_API_URL: ${{ vars.API_URL }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-      - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
         with:
-          node-version: 22
-      - name: Install dependencies
-        run: npm install
-      - name: Generate native iOS project
-        run: npx expo prebuild --platform ios --non-interactive
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Install JavaScript dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Check Expo dependency alignment
+        run: npx expo install --check
+
+      - name: Generate a clean iOS project
+        run: npx expo prebuild --clean --platform ios
+
       - name: Install CocoaPods
         working-directory: ios
-        run: pod install
-      - name: Compile for iOS Simulator
+        run: pod install --repo-update
+
+      - name: Find Xcode workspace and scheme
+        id: xcode-project
+        shell: bash
         run: |
-          xcodebuild -workspace ios/Plaquetas.xcworkspace \
-            -scheme Plaquetas \
+          set -euo pipefail
+          WORKSPACE="$(find ios -maxdepth 2 -type d -name '*.xcworkspace' -print -quit)"
+          test -n "$WORKSPACE"
+          LIST_JSON="$(xcodebuild -list -json -workspace "$WORKSPACE")"
+          SCHEME="$(printf '%s' "$LIST_JSON" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{const j=JSON.parse(s);const a=j.workspace?.schemes||[];const x=a.find(v=>v.toLowerCase()==="plaquetas")||a[0];if(!x)process.exit(2);process.stdout.write(x);});')"
+          echo "workspace=$WORKSPACE" >> "$GITHUB_OUTPUT"
+          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+          echo "Using workspace: $WORKSPACE"
+          echo "Using scheme: $SCHEME"
+
+      - name: Build for iOS Simulator
+        run: |
+          xcodebuild \
+            -workspace '${{ steps.xcode-project.outputs.workspace }}' \
+            -scheme '${{ steps.xcode-project.outputs.scheme }}' \
             -configuration Release \
-            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath ios-build \
-            CODE_SIGNING_ALLOWED=NO
-      - name: Upload iOS Simulator app
-        uses: actions/upload-artifact@v4
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package simulator app
+        run: |
+          APP_PATH="$(find ios-build/Build/Products/Release-iphonesimulator -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "$APP_PATH"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" Plaquetas-iOS-Simulator.zip
+
+      - name: Upload iOS Simulator build
+        uses: actions/upload-artifact@v7
         with:
           name: plaquetas-ios-simulator
-          path: ios-build/Build/Products/Release-iphonesimulator/Plaquetas.app
+          path: Plaquetas-iOS-Simulator.zip
           if-no-files-found: error
+          retention-days: 14
 
   ios-ipa:
-    name: iOS device IPA (requires Apple signing)
+    name: iOS IPA for real iPhones (Apple signing required)
     if: ${{ vars.BUILD_IOS_IPA == 'true' }}
     runs-on: macos-15
     env:
-      EXPO_PUBLIC_API_URL: ${{ vars.API_URL }}
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       IOS_CERTIFICATE_P12_BASE64: ${{ secrets.IOS_CERTIFICATE_P12_BASE64 }}
       IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
@@ -93,16 +149,21 @@ jobs:
       IOS_PROVISIONING_PROFILE_NAME: ${{ vars.IOS_PROVISIONING_PROFILE_NAME }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-      - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
         with:
-          node-version: 22
-      - name: Install dependencies
-        run: npm install
-      - name: Generate native iOS project
-        run: npx expo prebuild --platform ios --non-interactive
-      - name: Install Apple signing certificate and profile
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Install JavaScript dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Generate a clean iOS project
+        run: npx expo prebuild --clean --platform ios
+
+      - name: Install Apple signing certificate and provisioning profile
         shell: bash
         run: |
           set -euo pipefail
@@ -121,30 +182,47 @@ jobs:
           security list-keychains -d user -s build.keychain "$HOME/Library/Keychains/login.keychain-db"
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
           echo "$IOS_PROVISIONING_PROFILE_BASE64" | base64 --decode > profile.mobileprovision
-          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' /dev/stdin <<< "$(security cms -D -i profile.mobileprovision)")
+          PROFILE_UUID="$(security cms -D -i profile.mobileprovision | /usr/libexec/PlistBuddy -c 'Print UUID' /dev/stdin)"
           cp profile.mobileprovision "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+
       - name: Install CocoaPods
         working-directory: ios
-        run: pod install
+        run: pod install --repo-update
+
+      - name: Find Xcode workspace and scheme
+        id: xcode-project
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORKSPACE="$(find ios -maxdepth 2 -type d -name '*.xcworkspace' -print -quit)"
+          test -n "$WORKSPACE"
+          LIST_JSON="$(xcodebuild -list -json -workspace "$WORKSPACE")"
+          SCHEME="$(printf '%s' "$LIST_JSON" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{const j=JSON.parse(s);const a=j.workspace?.schemes||[];const x=a.find(v=>v.toLowerCase()==="plaquetas")||a[0];if(!x)process.exit(2);process.stdout.write(x);});')"
+          echo "workspace=$WORKSPACE" >> "$GITHUB_OUTPUT"
+          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+
       - name: Archive signed iOS app
         run: |
-          mkdir -p ios-build ipa-output
-          xcodebuild -workspace ios/Plaquetas.xcworkspace \
-            -scheme Plaquetas \
+          mkdir -p ios-build
+          xcodebuild \
+            -workspace '${{ steps.xcode-project.outputs.workspace }}' \
+            -scheme '${{ steps.xcode-project.outputs.scheme }}' \
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -archivePath ios-build/Plaquetas.xcarchive \
             DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
             CODE_SIGN_STYLE=Manual \
             PROVISIONING_PROFILE_SPECIFIER="$IOS_PROVISIONING_PROFILE_NAME" \
-            CODE_SIGNING_ALLOWED=YES archive
-      - name: Export IPA
+            CODE_SIGNING_ALLOWED=YES \
+            archive
+
+      - name: Export IPA for TestFlight / App Store Connect
         run: |
           cat > exportOptions.plist <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0"><dict>
-            <key>method</key><string>app-store</string>
+            <key>method</key><string>app-store-connect</string>
             <key>teamID</key><string>${APPLE_TEAM_ID}</string>
             <key>signingStyle</key><string>manual</string>
             <key>provisioningProfiles</key><dict>
@@ -156,9 +234,11 @@ jobs:
             -archivePath ios-build/Plaquetas.xcarchive \
             -exportOptionsPlist exportOptions.plist \
             -exportPath ipa-output
+
       - name: Upload signed IPA
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: plaquetas-ios-ipa
           path: ipa-output/*.ipa
           if-no-files-found: error
+          retention-days: 14

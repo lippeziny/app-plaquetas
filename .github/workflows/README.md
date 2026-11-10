@@ -1,25 +1,33 @@
-# GitHub Actions
+# Builds nativos pelo GitHub Actions
 
-- `build-native.yml`:
-  - APK Android para testes (`plaquetas-android-apk`).
-  - Aplicativo para simulador iOS, sem assinatura (`plaquetas-ios-simulator`).
-  - Job opcional `ios-ipa`, habilitado quando a variável `BUILD_IOS_IPA` estiver como `true`; compila e assina o IPA para distribuição usando certificados Apple.
-- `deploy-render.yml`: chama o Deploy Hook do Render quando o secret `RENDER_DEPLOY_HOOK` está configurado.
+O workflow `build-native.yml` cria três artefatos independentes:
 
-## Variáveis e secrets
+- `plaquetas-android-apk`: APK Android de release para instalação em aparelhos físicos.
+- `plaquetas-ios-simulator`: ZIP com o `.app` para simulador; não instala em iPhone físico.
+- `plaquetas-ios-ipa`: IPA assinado para distribuição via TestFlight/App Store Connect, somente quando o job estiver configurado.
 
-Em **Settings → Secrets and variables → Actions**:
+## API usada pelos aplicativos
 
-**Variables**
-- `API_URL`: endereço HTTPS público do backend.
-- `BUILD_IOS_IPA`: use `true` para habilitar o job de IPA.
-- `IOS_PROVISIONING_PROFILE_NAME`: nome exato do perfil de provisionamento Apple.
+Em **Settings → Secrets and variables → Actions → Variables**, configure `API_URL` com a URL HTTPS pública do backend. Se ela não existir, o workflow usa `https://plaquetas-by-lippe.onrender.com`, endereço declarado em `render.yaml`.
 
-**Secrets**
-- `RENDER_DEPLOY_HOOK`: Deploy Hook opcional do Render.
-- `APPLE_TEAM_ID`: Team ID da conta Apple Developer.
-- `IOS_CERTIFICATE_P12_BASE64`: certificado de distribuição `.p12`, codificado em Base64.
-- `IOS_CERTIFICATE_PASSWORD`: senha do arquivo `.p12`.
-- `IOS_PROVISIONING_PROFILE_BASE64`: perfil de provisionamento `.mobileprovision`, codificado em Base64.
+## IPA para iPhone físico
 
-A versão para simulador não exige conta Apple Developer. O IPA para iPhone físico/TestFlight exige certificado e perfil válidos vinculados ao Bundle ID `com.lippe.plaquetas`.
+O job só é executado quando a variável `BUILD_IOS_IPA` tem o valor `true`. Cadastre:
+
+| Tipo | Nome | Conteúdo |
+|---|---|---|
+| Secret | `APPLE_TEAM_ID` | Team ID da conta Apple Developer |
+| Secret | `IOS_CERTIFICATE_P12_BASE64` | Certificado de distribuição `.p12` convertido para Base64 |
+| Secret | `IOS_CERTIFICATE_PASSWORD` | Senha do arquivo `.p12` |
+| Secret | `IOS_PROVISIONING_PROFILE_BASE64` | Perfil de provisionamento compatível convertido para Base64 |
+| Variable | `IOS_PROVISIONING_PROFILE_NAME` | Nome exato do perfil de provisionamento |
+| Variable | `BUILD_IOS_IPA` | `true` |
+
+O Bundle ID configurado é `com.lippe.plaquetas`. O certificado e o perfil precisam corresponder a esse identificador e ao mesmo Apple Team. O método configurado exporta para App Store Connect/TestFlight; ele não é um IPA Ad Hoc para instalação direta por sideload.
+
+## Observações
+
+- Não existe `package-lock.json` nesta cópia do projeto. Por isso, os jobs usam `npm install` e não habilitam cache npm. O workflow não falha mais no `setup-node` por ausência de lockfile.
+- O Android usa Java 17.
+- As pastas `android/` e `ios/` são geradas novamente por `expo prebuild --clean`; elas não precisam ser versionadas.
+- O APK gerado sem keystore próprio usa a assinatura de debug do runner. Para atualizar uma instalação anterior assinada com outra chave, desinstale a versão anterior antes de instalar o novo APK.
