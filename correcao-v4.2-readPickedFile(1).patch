@@ -1,0 +1,6 @@
+*** Begin Patch
+*** Update File: App.tsx
+@@
+-      const base64 = await readPickedFileBase64(asset);
++      const base64 = bytesToBase64(await readPickedFileBytes(asset));
+*** End Patch
