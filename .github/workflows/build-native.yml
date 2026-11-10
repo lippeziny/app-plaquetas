@@ -2,6 +2,12 @@ name: Build Android and iOS
 
 on:
   workflow_dispatch:
+    inputs:
+      build_ios_ipa:
+        description: 'Gerar IPA assinado para iPhone físico (requer certificados Apple configurados)'
+        required: false
+        type: boolean
+        default: false
   push:
     branches: [main]
 
@@ -45,6 +51,9 @@ jobs:
       - name: Install JavaScript dependencies
         run: npm install --no-audit --no-fund
 
+      - name: Check TypeScript types
+        run: npm run typecheck
+
       - name: Check Expo dependency alignment
         run: npx expo install --check
 
@@ -87,6 +96,9 @@ jobs:
 
       - name: Install JavaScript dependencies
         run: npm install --no-audit --no-fund
+
+      - name: Check TypeScript types
+        run: npm run typecheck
 
       - name: Check Expo dependency alignment
         run: npx expo install --check
@@ -139,7 +151,7 @@ jobs:
 
   ios-ipa:
     name: iOS IPA for real iPhones (Apple signing required)
-    if: ${{ vars.BUILD_IOS_IPA == 'true' }}
+    if: ${{ vars.BUILD_IOS_IPA == 'true' || inputs.build_ios_ipa }}
     runs-on: macos-15
     env:
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -159,6 +171,15 @@ jobs:
 
       - name: Install JavaScript dependencies
         run: npm install --no-audit --no-fund
+
+      - name: Check TypeScript types
+        run: npm run typecheck
+
+      - name: Check Expo dependency alignment
+        run: npx expo install --check
+
+      - name: Run project tests
+        run: npm test
 
       - name: Generate a clean iOS project
         run: npx expo prebuild --clean --platform ios

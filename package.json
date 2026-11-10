@@ -12,11 +12,12 @@
     "start:server": "node server/index.cjs",
     "dev": "concurrently -k \"npm:dev:api\" \"npm:start:web\"",
     "build:web": "expo export --platform web",
-    "test": "node --test"
+    "test": "node --test",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.3",
-    "@react-native-picker/picker": "^2.11.1",
+    "@react-native-picker/picker": "2.11.1",
     "adm-zip": "^0.5.16",
     "cors": "^2.8.5",
     "expo": "~54.0.25",

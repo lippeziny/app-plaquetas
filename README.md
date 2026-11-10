@@ -11,7 +11,7 @@ Aplicativo universal (website Node.js + Android + iOS) para importar uma base Ex
 - **Modelo substituível:** aceita outro `.pptx`. A detecção procura nomes de caixa como `name.item` e `cod.item`; também tenta reconhecer os campos visíveis no modelo atual. Quando não consegue identificar, a tela oferece um mapeamento por IDs das caixas de texto.
 - **Exportação:** gera PPTX preservando os objetos e a formatação do slide selecionado, substituindo somente o conteúdo textual dos campos de nome e código. O PDF é convertido a partir desse PPTX usando LibreOffice no servidor.
 - **Contagem experimental:** leitor de QR Code/código de barras, pesquisa do item e registro manual por toque de `+1` ou `+10`. Os registros acumulam por código.
-- **Compilação pelo GitHub Actions:** workflow Android gera APK para aparelho físico; workflow iOS gera um pacote de simulador e inclui um job opcional para IPA assinado. O app agora mostra uma tela de recuperação caso ocorra um erro de renderização.
+- **Compilação pelo GitHub Actions:** workflow Android gera APK para aparelho físico; workflow iOS gera um pacote de simulador e inclui um job opcional para IPA assinado. O projeto executa verificação de tipos TypeScript e compatibilidade dos pacotes Expo antes do build.
 
 ## Executar localmente
 
@@ -66,15 +66,15 @@ Para acionar deploy por GitHub Actions, crie o secret `RENDER_DEPLOY_HOOK` com o
 
 ## Compilar Android e iOS pelo GitHub
 
-O workflow `.github/workflows/build-native.yml` executa automaticamente em pushes na branch `main` ou manualmente em **Actions → Build Android and iOS → Run workflow**. Ele usa Node 22, Java 17 para Android, recria as pastas nativas com `expo prebuild --clean` e não tenta usar cache npm enquanto não existir um lockfile no repositório.
+O workflow `.github/workflows/build-native.yml` executa automaticamente em pushes na branch `main` ou manualmente em **Actions → Build Android and iOS → Run workflow**. Ele usa Node 22, Java 17 para Android, recria as pastas nativas com `expo prebuild --clean`, verifica os tipos TypeScript e a compatibilidade do Expo antes de compilar. O Picker está fixado em `2.11.1`, versão recomendada para o SDK 54; assim, o npm não instala automaticamente a `2.11.4`, que foi rejeitada nos logs enviados.
 
 - **Android:** baixa o artefato `plaquetas-android-apk` com `app-release.apk`, instalável para testes em aparelhos Android. O APK de teste é assinado com a configuração de desenvolvimento do projeto e não é uma versão pronta para publicação na Play Store.
 - **iOS:** baixa `plaquetas-ios-simulator`, um ZIP de `.app` compilado para o simulador iOS. Esse arquivo não instala em um iPhone físico.
-- **iPhone físico/TestFlight:** o job opcional `ios-ipa` pode gerar `plaquetas-ios-ipa` quando a variável `BUILD_IOS_IPA` estiver como `true` e os certificados/perfil Apple descritos em `.github/workflows/README.md` estiverem cadastrados nos Secrets. É necessária uma conta Apple Developer e um perfil de distribuição válido.
+- **iPhone físico/TestFlight:** o job opcional `ios-ipa` pode gerar `plaquetas-ios-ipa` quando a opção de IPA for marcada ao executar manualmente o workflow (ou a variável `BUILD_IOS_IPA` estiver como `true`) e os certificados/perfil Apple descritos em `.github/workflows/README.md` estiverem cadastrados nos Secrets. É necessária uma conta Apple Developer e um perfil de distribuição válido.
 
 Para que os apps nativos acessem o servidor publicado, crie em **Settings → Secrets and variables → Actions → Variables** a variável `API_URL` com a URL HTTPS pública da API. O workflow repassa essa variável para `EXPO_PUBLIC_API_URL` durante a compilação. Quando `API_URL` estiver ausente, usa o endereço Render já declarado no `render.yaml`.
 
-**Limitação importante do iOS:** a compilação para simulador não exige assinatura e não instala em um iPhone físico. Para gerar IPA e distribuir via TestFlight/App Store, é necessária uma conta Apple Developer e certificados/perfil válidos. O workflow já contém um job opcional de IPA; consulte `.github/workflows/README.md` para cadastrar os Secrets e habilitá-lo. A versão SDK 54 está configurada temporariamente com a arquitetura antiga do React Native como medida de compatibilidade para investigar a falha de inicialização do APK anterior; o SDK 54 permite alternar essa configuração.
+**Limitação importante do iOS:** a compilação para simulador não exige assinatura e não instala em um iPhone físico. Para gerar IPA e distribuir via TestFlight/App Store, é necessária uma conta Apple Developer e certificados/perfil válidos. O workflow já contém um job opcional de IPA; consulte `.github/workflows/README.md` para cadastrar os Secrets e habilitá-lo. O hook `useWindowDimensions` é importado de `react-native` (e não de `react`), evitando a chamada de uma função inexistente durante a montagem da tela inicial. A configuração do SDK 54 continua com `newArchEnabled: false` como medida de compatibilidade; isso não substitui o teste do APK em aparelho físico.
 
 ## Dados e segurança
 

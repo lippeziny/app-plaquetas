@@ -12,7 +12,7 @@ Em **Settings → Secrets and variables → Actions → Variables**, configure `
 
 ## IPA para iPhone físico
 
-O job só é executado quando a variável `BUILD_IOS_IPA` tem o valor `true`. Cadastre:
+O job é opcional. Ao executar manualmente o workflow, marque a opção **Gerar IPA assinado para iPhone físico**; alternativamente, configure a variável `BUILD_IOS_IPA` como `true`. Nos dois casos, os certificados e perfis Apple precisam estar cadastrados. Cadastre:
 
 | Tipo | Nome | Conteúdo |
 |---|---|---|
@@ -29,5 +29,7 @@ O Bundle ID configurado é `com.lippe.plaquetas`. O certificado e o perfil preci
 
 - Não existe `package-lock.json` nesta cópia do projeto. Por isso, os jobs usam `npm install` e não habilitam cache npm. O workflow não falha mais no `setup-node` por ausência de lockfile.
 - O Android usa Java 17.
+- O pacote `@react-native-picker/picker` está fixado em `2.11.1`, versão recomendada pelo Expo SDK 54.
+- Antes dos builds, o workflow verifica os tipos TypeScript, a compatibilidade dos pacotes Expo e os testes do projeto.
 - As pastas `android/` e `ios/` são geradas novamente por `expo prebuild --clean`; elas não precisam ser versionadas.
 - O APK gerado sem keystore próprio usa a assinatura de debug do runner. Para atualizar uma instalação anterior assinada com outra chave, desinstale a versão anterior antes de instalar o novo APK.
