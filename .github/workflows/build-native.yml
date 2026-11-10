@@ -18,6 +18,18 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
+      # Gradle 8.14.3 cannot run on Java 25 (class-file version 69).
+      # Pin the Android build runner to JDK 17 for a stable AGP 8.x toolchain.
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          architecture: x64
+      - name: Verify Java and Gradle runtime
+        run: |
+          java -version
+          echo "JAVA_HOME=$JAVA_HOME"
       - name: Install dependencies
         run: npm install
       - name: Generate native Android project
