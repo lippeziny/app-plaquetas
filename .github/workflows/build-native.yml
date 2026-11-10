@@ -15,10 +15,9 @@ permissions:
   contents: read
 
 # Keep the Android toolchain on Java 17: Expo SDK 54 / its Gradle plugins
-# are built with the JDK 17 toolchain. Node 22 is used for Expo CLI.
+# are built with the JDK 17 toolchain. Node 22 is used for Expo CLI. The mobile app processes data locally and does not use a backend URL.
 env:
   CI: '1'
-  EXPO_PUBLIC_API_URL: ${{ vars.API_URL || 'https://plaquetas-by-lippe.onrender.com' }}
 
 jobs:
   android:

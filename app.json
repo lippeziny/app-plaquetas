@@ -18,6 +18,10 @@
       "package": "com.lippe.plaquetas",
       "permissions": [
         "CAMERA"
+      ],
+      "blockedPermissions": [
+        "android.permission.INTERNET",
+        "android.permission.ACCESS_NETWORK_STATE"
       ]
     },
     "plugins": [

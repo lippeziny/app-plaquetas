@@ -2,7 +2,6 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   Alert,
-  Linking,
   Platform,
   Pressable,
   ScrollView,
@@ -18,6 +17,13 @@ import * as DocumentPicker from 'expo-document-picker';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
+import { Asset } from 'expo-asset';
+import * as Print from 'expo-print';
+import { applyTemplateFieldMapping, buildPptx, type SlidePositionSettings, type TemplateVisual } from './offline/pptx';
+import TemplatePreview from './offline/TemplatePreview';
+import { buildLabelsPdfHtml } from './offline/pdf';
+import { importWorkbookSheet, normalizeSearch, parseWorkbookBase64, previewWorkbookSheet, type ParsedWorkbook } from './offline/workbook';
+import { EMPTY_LOCAL_DATA, readLocalData, writeLocalData, type StoredAppData } from './offline/storage';
 import { Ionicons } from '@expo/vector-icons';
 
 type TemplateField = { id: string; shape: string; sample: string };
@@ -30,37 +36,102 @@ type TemplateSlide = {
   nameFields: TemplateField[];
   codeFields: TemplateField[];
   shapes: { id: string; shape: string; text: string; field: string | null }[];
+  visuals: TemplateVisual[];
 };
 type TemplateInfo = { templateId: string; name: string; slides: TemplateSlide[] };
 type CatalogItem = { code: string; name: string; quantity?: string; sheetName?: string };
 type LabelItem = CatalogItem & { localId: string; sourceInput?: string };
 type WorkbookPreview = { headers: string[]; rows: string[][]; columns: { index: number; label: string }[]; suggested: { codeColumn: number; nameColumn: number; quantityColumn: number } };
-type ExportResult = { fileName: string; format: string; downloadUrl: string; pages: number; capacity: number; printedItems: number; remainingItems: number };
+type ExportResult = { fileName: string; format: string; pages: number; capacity: number; printedItems: number; remainingItems: number };
 
-const ENV_API = process.env.EXPO_PUBLIC_API_URL || '';
-const WEB_LOCALHOST = Platform.OS === 'web' && typeof window !== 'undefined' && ['localhost', '127.0.0.1'].includes(window.location.hostname);
-const DEFAULT_API = ENV_API || (Platform.OS === 'web' ? (WEB_LOCALHOST ? 'http://localhost:4000' : '') : 'https://plaquetas-by-lippe.onrender.com');
+declare const require: (path: string) => any;
+const DEFAULT_TEMPLATE_ASSET = require('./assets/default-template.pptx');
 const GREEN = '#17734F';
 const INK = '#17251F';
 const MUTED = '#75827B';
 const LINE = '#E2E9E4';
 
+type AppTheme = { id: string; name: string; primary: string; onPrimary: string; primaryContainer: string; onPrimaryContainer: string; secondary: string; tertiary: string; background: string; surface: string; surfaceContainer: string; surfaceVariant: string; outline: string; };
+const APP_THEMES: AppTheme[] = [
+  { id: 'azul', name: 'Azul', primary: '#315B9A', onPrimary: '#FFFFFF', primaryContainer: '#D7E3FF', onPrimaryContainer: '#001B3F', secondary: '#565F71', tertiary: '#715573', background: '#F7F8FF', surface: '#FFFFFF', surfaceContainer: '#EEF1F8', surfaceVariant: '#E1E5EF', outline: '#747984' },
+  { id: 'verde', name: 'Verde', primary: '#386A4A', onPrimary: '#FFFFFF', primaryContainer: '#C9EBD0', onPrimaryContainer: '#00210F', secondary: '#506352', tertiary: '#496879', background: '#F5FAF5', surface: '#FFFFFF', surfaceContainer: '#EAF2E9', surfaceVariant: '#DDE7DC', outline: '#727970' },
+  { id: 'roxo', name: 'Roxo', primary: '#65558F', onPrimary: '#FFFFFF', primaryContainer: '#EADDFF', onPrimaryContainer: '#210D4A', secondary: '#625B71', tertiary: '#7D5260', background: '#FBF7FF', surface: '#FFFFFF', surfaceContainer: '#F1ECF8', surfaceVariant: '#E7E0F0', outline: '#797583' },
+  { id: 'laranja', name: 'Âmbar', primary: '#805600', onPrimary: '#FFFFFF', primaryContainer: '#FFDEA5', onPrimaryContainer: '#291800', secondary: '#6B5D40', tertiary: '#8B4B3A', background: '#FFFAF2', surface: '#FFFFFF', surfaceContainer: '#F6EFE2', surfaceVariant: '#EDE2CF', outline: '#817668' },
+  { id: 'turquesa', name: 'Turquesa', primary: '#006A69', onPrimary: '#FFFFFF', primaryContainer: '#9CF1EE', onPrimaryContainer: '#00201F', secondary: '#4A6363', tertiary: '#4C5E7F', background: '#F2FAF9', surface: '#FFFFFF', surfaceContainer: '#E6F2F1', surfaceVariant: '#D9E7E5', outline: '#6F7978' },
+];
+const EMPTY_POSITION_SETTINGS: SlidePositionSettings = { global: {}, slots: {} };
+
 function showMessage(message: string) {
   if (Platform.OS === 'web') {
-    // Alert.alert is supported by React Native Web, but window.alert keeps the message visible in browsers.
     if (typeof window !== 'undefined') window.alert(message);
     else Alert.alert('Plaquetas', message);
   } else Alert.alert('Plaquetas', message);
 }
 function makeId() { return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; }
 function splitValues(text: string) { return text.split(/[\n,;\t]+/).map(v => v.trim()).filter(Boolean); }
-
-async function fetchJson<T>(base: string, endpoint: string, options?: RequestInit): Promise<T> {
-  if (!base.trim() && Platform.OS !== 'web') throw new Error('Configure o endereço HTTPS do servidor nas configurações do aplicativo.');
-  const response = await fetch(`${base.replace(/\/$/, '')}${endpoint}`, options);
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.error || `Falha na comunicação (${response.status}).`);
-  return payload as T;
+function parseShapeIds(value: string) { return value.split(/[\s,;]+/).map(v => v.trim()).filter(Boolean); }
+function bytesToBase64(bytes: Uint8Array): string {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  let output = '';
+  for (let index = 0; index < bytes.length; index += 3) {
+    const a = bytes[index];
+    const hasB = index + 1 < bytes.length;
+    const hasC = index + 2 < bytes.length;
+    const b = hasB ? bytes[index + 1] : 0;
+    const c = hasC ? bytes[index + 2] : 0;
+    output += alphabet[a >> 2];
+    output += alphabet[((a & 3) << 4) | (b >> 4)];
+    output += hasB ? alphabet[((b & 15) << 2) | (c >> 6)] : '=';
+    output += hasC ? alphabet[c & 63] : '=';
+  }
+  return output;
+}
+async function readPickedFileBase64(asset: any): Promise<string> {
+  if (Platform.OS === 'web' && asset.file?.arrayBuffer) {
+    return bytesToBase64(new Uint8Array(await asset.file.arrayBuffer()));
+  }
+  return FileSystem.readAsStringAsync(asset.uri, { encoding: FileSystem.EncodingType.Base64 });
+}
+async function readTemplateAssetBase64(): Promise<string> {
+  const asset = Asset.fromModule(DEFAULT_TEMPLATE_ASSET);
+  await asset.downloadAsync();
+  const uri = asset.localUri || asset.uri;
+  if (Platform.OS === 'web') {
+    const response = await fetch(uri);
+    if (!response.ok) throw new Error('Não foi possível carregar o modelo PowerPoint incluído no aplicativo.');
+    return bytesToBase64(new Uint8Array(await response.arrayBuffer()));
+  }
+  return FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.Base64 });
+}
+async function persistPickedTemplate(asset: any, base64: string, fileName: string): Promise<Partial<StoredAppData>> {
+  if (Platform.OS === 'web') return { templateBase64: base64, templateUri: undefined, templateName: fileName };
+  const root = FileSystem.documentDirectory;
+  if (!root) throw new Error('O armazenamento interno do aparelho não está disponível.');
+  const directory = `${root}templates/`;
+  await FileSystem.makeDirectoryAsync(directory, { intermediates: true }).catch(() => {});
+  const safeName = `modelo-${Date.now()}.pptx`;
+  const destination = directory + safeName;
+  await FileSystem.copyAsync({ from: asset.uri, to: destination });
+  return { templateUri: destination, templateBase64: undefined, templateName: fileName };
+}
+async function saveAndShareBase64(base64: string, fileName: string, mimeType: string) {
+  if (Platform.OS === 'web') {
+    const uri = `data:${mimeType};base64,${base64}`;
+    const anchor = document.createElement('a');
+    anchor.href = uri;
+    anchor.download = fileName;
+    anchor.click();
+    return;
+  }
+  const directory = FileSystem.cacheDirectory || FileSystem.documentDirectory;
+  if (!directory) throw new Error('Não foi possível acessar o armazenamento temporário do aparelho.');
+  const uri = `${directory}${fileName}`;
+  await FileSystem.writeAsStringAsync(uri, base64, { encoding: FileSystem.EncodingType.Base64 });
+  if (await Sharing.isAvailableAsync()) {
+    await Sharing.shareAsync(uri, { mimeType, dialogTitle: `Compartilhar ${fileName}` });
+  } else {
+    showMessage(`Arquivo criado em: ${uri}`);
+  }
 }
 
 async function chooseFile(type: string) {
@@ -68,73 +139,71 @@ async function chooseFile(type: string) {
   if (result.canceled || !result.assets?.length) return null;
   return result.assets[0];
 }
-async function uploadPickedFile(base: string, endpoint: string, asset: any) {
-  const form = new FormData();
-  if (Platform.OS === 'web' && asset.file) form.append('file', asset.file);
-  else form.append('file', { uri: asset.uri, name: asset.name || 'upload.xlsx', type: asset.mimeType || 'application/octet-stream' } as any);
-  return fetchJson<any>(base, endpoint, { method: 'POST', body: form });
-}
 
-function SectionTitle({ eyebrow, title, subtitle }: { eyebrow: string; title: string; subtitle?: string }) {
+function SectionTitle({ eyebrow, title, subtitle, accent = GREEN, titleColor = INK }: { eyebrow: string; title: string; subtitle?: string; accent?: string; titleColor?: string }) {
   return <View style={styles.sectionTitle}>
-    <Text style={styles.eyebrow}>{eyebrow}</Text>
-    <Text style={styles.sectionHeading}>{title}</Text>
+    <Text style={[styles.eyebrow, { color: accent }]}>{eyebrow}</Text>
+    <Text style={[styles.sectionHeading, { color: titleColor }]}>{title}</Text>
     {!!subtitle && <Text style={styles.sectionSub}>{subtitle}</Text>}
   </View>;
 }
-function ActionButton({ title, onPress, icon, secondary = false, disabled = false, small = false }: { title: string; onPress: () => void; icon?: any; secondary?: boolean; disabled?: boolean; small?: boolean }) {
-  return <Pressable onPress={onPress} disabled={disabled} style={({ pressed }) => [styles.button, secondary ? styles.buttonSecondary : styles.buttonPrimary, small && styles.buttonSmall, disabled && styles.buttonDisabled, pressed && !disabled && styles.buttonPressed]}>
-    {!!icon && <Ionicons name={icon} size={small ? 15 : 17} color={secondary ? GREEN : '#FFFFFF'} />}
-    <Text style={[styles.buttonText, secondary && styles.buttonTextSecondary, small && styles.buttonTextSmall]}>{title}</Text>
+function ActionButton({ title, onPress, icon, secondary = false, disabled = false, small = false, primaryColor = GREEN, secondaryBackground, textColor }: { title: string; onPress: () => void; icon?: any; secondary?: boolean; disabled?: boolean; small?: boolean; primaryColor?: string; secondaryBackground?: string; textColor?: string }) {
+  return <Pressable onPress={onPress} disabled={disabled} style={({ pressed }) => [styles.button, secondary ? styles.buttonSecondary : styles.buttonPrimary, !secondary && { backgroundColor: primaryColor }, secondary && { backgroundColor: secondaryBackground || `${primaryColor}14`, borderColor: `${primaryColor}45` }, small && styles.buttonSmall, disabled && styles.buttonDisabled, pressed && !disabled && styles.buttonPressed]}>
+    {!!icon && <Ionicons name={icon} size={small ? 15 : 17} color={secondary ? primaryColor : (textColor || '#FFFFFF')} />}
+    <Text style={[styles.buttonText, secondary && { color: primaryColor }, !secondary && textColor ? { color: textColor } : null, small && styles.buttonTextSmall]}>{title}</Text>
   </Pressable>;
 }
 function Card({ children, style }: { children: React.ReactNode; style?: any }) {
   return <View style={[styles.card, style]}>{children}</View>;
 }
 
-function CameraScanner({ onScan, onClose }: { onScan: (data: string) => void; onClose: () => void }) {
+function CameraScanner({ onScan, onClose, accent = GREEN }: { onScan: (data: string) => void; onClose: () => void; accent?: string }) {
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   return (
     <View style={styles.cameraContainer}>
       {!cameraPermission?.granted ? (
         <View style={styles.cameraPermission}>
-          <Ionicons name="camera-outline" size={28} color={GREEN} />
+          <Ionicons name="camera-outline" size={28} color={accent} />
           <Text style={styles.helper}>A câmera precisa de permissão.</Text>
-          <ActionButton title="Permitir câmera" onPress={async () => { const result = await requestCameraPermission(); if (!result.granted) showMessage('A permissão da câmera não foi concedida.'); }} />
+          <ActionButton title="Permitir câmera" onPress={async () => { const result = await requestCameraPermission(); if (!result.granted) showMessage('A permissão da câmera não foi concedida.'); }} primaryColor={accent} />
         </View>
       ) : (
         <CameraView style={styles.camera} facing="back" onBarcodeScanned={({ data }) => onScan(data)} barcodeScannerSettings={{ barcodeTypes: ['qr', 'ean13', 'ean8', 'code128', 'code39', 'upc_a', 'upc_e'] }} />
       )}
-      <ActionButton title="Fechar leitor" onPress={onClose} secondary small />
+      <ActionButton title="Fechar leitor" onPress={onClose} secondary small primaryColor={accent} />
     </View>
   );
 }
 
 function AppScreen() {
   const { width } = useWindowDimensions();
-  const [apiUrl, setApiUrl] = useState(DEFAULT_API);
-  const [apiEdit, setApiEdit] = useState(DEFAULT_API);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [apiReady, setApiReady] = useState(false);
+  const [localReady, setLocalReady] = useState(false);
   const [busy, setBusy] = useState('');
   const [tab, setTab] = useState<'labels' | 'count'>('labels');
-
+  const [workflowStep, setWorkflowStep] = useState<'data' | 'items' | 'layout'>('data');
+  const [themeId, setThemeId] = useState('azul');
+  const [themePickerOpen, setThemePickerOpen] = useState(false);
+  const [templateAdjustments, setTemplateAdjustments] = useState<Record<string, SlidePositionSettings>>({});
+  const [adjustScope, setAdjustScope] = useState<'global' | 'single'>('global');
+  const [adjustField, setAdjustField] = useState<'code' | 'name'>('name');
+  const [adjustSlotIndex, setAdjustSlotIndex] = useState(0);
+  const [adjustStep, setAdjustStep] = useState(1);
   const [database, setDatabase] = useState({ total: 0, sheetName: '', sourceFile: '', ready: false });
   const [databaseFile, setDatabaseFile] = useState('');
-  const [uploadId, setUploadId] = useState('');
   const [sheetNames, setSheetNames] = useState<string[]>([]);
   const [sheetName, setSheetName] = useState('');
   const [workbookPreview, setWorkbookPreview] = useState<WorkbookPreview | null>(null);
+  const [workbookData, setWorkbookData] = useState<ParsedWorkbook | null>(null);
   const [codeColumn, setCodeColumn] = useState(1);
   const [nameColumn, setNameColumn] = useState(2);
   const [quantityColumn, setQuantityColumn] = useState(6);
-
+  const [catalog, setCatalog] = useState<CatalogItem[]>([]);
   const [template, setTemplate] = useState<TemplateInfo | null>(null);
+  const [templateBase64, setTemplateBase64] = useState('');
   const [templateSlide, setTemplateSlide] = useState(0);
   const [customCodeIds, setCustomCodeIds] = useState('');
   const [customNameIds, setCustomNameIds] = useState('');
   const [templateError, setTemplateError] = useState('');
-
   const [inputMode, setInputMode] = useState<'code' | 'name'>('code');
   const [inputText, setInputText] = useState('');
   const [suggestions, setSuggestions] = useState<CatalogItem[]>([]);
@@ -143,13 +212,19 @@ function AppScreen() {
   const [compactPreview, setCompactPreview] = useState(false);
   const [requestedPages, setRequestedPages] = useState('');
   const [lastExport, setLastExport] = useState<ExportResult | null>(null);
-
   const [scanEnabled, setScanEnabled] = useState(false);
   const [scanCode, setScanCode] = useState('');
   const [scanName, setScanName] = useState('');
   const [scanStep, setScanStep] = useState<1 | 10>(1);
   const [counts, setCounts] = useState<CatalogItem[]>([]);
   const lastScan = useRef({ code: '', at: 0 });
+  const localDataRef = useRef<StoredAppData>(EMPTY_LOCAL_DATA);
+
+  const persistPatch = useCallback(async (patch: Partial<StoredAppData>) => {
+    const next = { ...localDataRef.current, ...patch };
+    localDataRef.current = next;
+    await writeLocalData(next);
+  }, []);
 
   const selectedSlide = template?.slides?.[templateSlide] || template?.slides?.[0];
   const manualCapacity = Math.min(customCodeIds.split(/[\s,;]+/).filter(Boolean).length, customNameIds.split(/[\s,;]+/).filter(Boolean).length);
@@ -157,90 +232,136 @@ function AppScreen() {
   const requiredPages = Math.max(1, Math.ceil(labels.length / Math.max(capacity, 1)));
   const activeLabel = labels[activeLabelIndex] || labels[0];
   const validCustomFields = customCodeIds.trim().length > 0 && customNameIds.trim().length > 0;
+  const theme = APP_THEMES.find(option => option.id === themeId) || APP_THEMES[0];
+  const adjustmentKey = `${template?.templateId || 'local'}:${template?.name || 'modelo-padrao'}:${templateSlide}`;
+  const storedAdjustments = templateAdjustments[adjustmentKey] || EMPTY_POSITION_SETTINGS;
+  const activeAdjustments: SlidePositionSettings = { global: storedAdjustments.global || {}, slots: storedAdjustments.slots || {} };
+  const selectedFieldDelta = adjustScope === 'global'
+    ? activeAdjustments.global[adjustField]
+    : activeAdjustments.slots[String(adjustSlotIndex)]?.[adjustField];
+  const previewSlide = useMemo(() => {
+    if (!selectedSlide) return undefined;
+    if (!validCustomFields) return selectedSlide;
+    return applyTemplateFieldMapping(selectedSlide, parseShapeIds(customCodeIds), parseShapeIds(customNameIds));
+  }, [selectedSlide, validCustomFields, customCodeIds, customNameIds]);
 
-  const apiCall = useCallback(<T,>(endpoint: string, options?: RequestInit) => fetchJson<T>(apiUrl, endpoint, options), [apiUrl]);
-
-  const refreshCounts = useCallback(async () => {
-    const result = await fetchJson<any>(apiUrl, '/api/counts');
-    setCounts(result.results || []);
-  }, [apiUrl]);
+  const selectTheme = async (id: string) => {
+    setThemeId(id);
+    setThemePickerOpen(false);
+    await persistPatch({ themeId: id });
+  };
+  const updateTemplatePosition = async (dx: number, dy: number) => {
+    const current = templateAdjustments[adjustmentKey] || EMPTY_POSITION_SETTINGS;
+    const target = adjustScope === 'global'
+      ? { ...(current.global[adjustField] || { xMm: 0, yMm: 0 }), xMm: (current.global[adjustField]?.xMm || 0) + dx, yMm: (current.global[adjustField]?.yMm || 0) + dy }
+      : { ...(current.slots[String(adjustSlotIndex)]?.[adjustField] || { xMm: 0, yMm: 0 }), xMm: (current.slots[String(adjustSlotIndex)]?.[adjustField]?.xMm || 0) + dx, yMm: (current.slots[String(adjustSlotIndex)]?.[adjustField]?.yMm || 0) + dy };
+    const next: SlidePositionSettings = adjustScope === 'global'
+      ? { ...current, global: { ...current.global, [adjustField]: target } }
+      : { ...current, slots: { ...current.slots, [String(adjustSlotIndex)]: { ...current.slots[String(adjustSlotIndex)], [adjustField]: target } } };
+    const all = { ...templateAdjustments, [adjustmentKey]: next };
+    setTemplateAdjustments(all);
+    await persistPatch({ templateAdjustments: all });
+  };
+  const resetTemplatePositions = async () => {
+    const all = { ...templateAdjustments };
+    delete all[adjustmentKey];
+    setTemplateAdjustments(all);
+    await persistPatch({ templateAdjustments: all });
+  };
 
   useEffect(() => {
     let alive = true;
-    if (!apiUrl.trim()) {
-      setApiReady(false);
-      setTemplate(null);
-      setDatabase({ total: 0, sheetName: '', sourceFile: '', ready: false });
-      return () => { alive = false; };
-    }
     (async () => {
       try {
-        await fetchJson(apiUrl, '/api/health');
-        const [info, status] = await Promise.all([
-          fetchJson<TemplateInfo>(apiUrl, '/api/templates/default'),
-          fetchJson<any>(apiUrl, '/api/database/status')
-        ]);
+        const saved = await readLocalData();
+        let base64 = saved.templateBase64 || '';
+        if (!base64 && saved.templateUri) {
+          try { base64 = await FileSystem.readAsStringAsync(saved.templateUri, { encoding: FileSystem.EncodingType.Base64 }); }
+          catch (error) { console.warn('Modelo local salvo não pôde ser reaberto. Será usado o modelo padrão.', error); }
+        }
+        if (!base64) base64 = await readTemplateAssetBase64();
+        const info = await (await import('./offline/pptx')).inspectPptx(base64, saved.templateName || 'PLAQUETAS_BY_FILLIPE.PPTX');
         if (!alive) return;
-        setApiReady(true);
+        localDataRef.current = saved;
+        setCatalog(saved.catalog);
+        setDatabase(saved.database);
+        setTemplateAdjustments(saved.templateAdjustments || {});
+        setThemeId(APP_THEMES.some(theme => theme.id === saved.themeId) ? (saved.themeId as string) : 'azul');
+        setDatabaseFile(saved.database.sourceFile || '');
+        setCounts(saved.counts);
         setTemplate(info);
-        setDatabase(status);
-      } catch (_error) {
-        if (alive) setApiReady(false);
+        setTemplateBase64(base64);
+        setLocalReady(true);
+        if (saved.templateUri && !saved.templateBase64 && !saved.templateName) {
+          await persistPatch({ templateName: info.name });
+        }
+      } catch (error: any) {
+        if (alive) showMessage(`Não foi possível preparar o aplicativo offline: ${error.message || error}`);
       }
     })();
     return () => { alive = false; };
-  }, [apiUrl]);
+  }, [persistPatch]);
 
   useEffect(() => {
-    if (tab === 'count' && apiReady) refreshCounts().catch(() => {});
-  }, [tab, apiReady, refreshCounts]);
+    if (inputMode !== 'name' || inputText.trim().length < 2 || !localReady) { setSuggestions([]); return; }
+    const query = normalizeSearch(inputText.split(/[\n,;]+/).pop() || '');
+    if (!query) { setSuggestions([]); return; }
+    setSuggestions(catalog.filter(item => normalizeSearch(item.name).includes(query)).slice(0, 8));
+  }, [inputText, inputMode, catalog, localReady]);
 
-  useEffect(() => {
-    if (inputMode !== 'name' || inputText.trim().length < 3 || !apiReady) { setSuggestions([]); return; }
-    let alive = true;
-    const q = encodeURIComponent(inputText.split(/[\n,;]+/).pop()?.trim() || '');
-    fetchJson<any>(apiUrl, `/api/database/search?mode=name&q=${q}`).then(result => {
-      if (alive) setSuggestions(result.results || []);
-    }).catch(() => { if (alive) setSuggestions([]); });
-    return () => { alive = false; };
-  }, [inputText, inputMode, apiReady, apiUrl]);
+  const refreshCounts = useCallback(async () => {
+    const stored = await readLocalData();
+    localDataRef.current = stored;
+    setCounts(stored.counts || []);
+  }, []);
 
-  const loadSheetPreview = useCallback(async (id: string, name: string) => {
-    if (!id || !name) return;
-    setBusy('Lendo cabeçalhos da aba...');
+  const loadSheetPreview = useCallback(async (name: string) => {
+    if (!workbookData || !name) return;
     try {
-      const preview = await apiCall<WorkbookPreview>('/api/database/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uploadId: id, sheetName: name }) });
+      const preview = previewWorkbookSheet(workbookData, name, 5);
       setWorkbookPreview(preview);
       setCodeColumn(preview.suggested.codeColumn || 1);
       setNameColumn(preview.suggested.nameColumn || 2);
       setQuantityColumn(preview.suggested.quantityColumn || 0);
     } catch (error: any) { showMessage(error.message); }
-    finally { setBusy(''); }
-  }, [apiCall]);
+  }, [workbookData]);
 
   const onChooseDatabase = async () => {
     try {
       const asset = await chooseFile('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       if (!asset) return;
-      setBusy('Analisando planilha...');
-      const result = await uploadPickedFile(apiUrl, '/api/database/inspect', asset);
-      setUploadId(result.uploadId);
-      setDatabaseFile(result.fileName);
-      setSheetNames(result.sheets || []);
-      const first = result.sheets?.[0] || '';
+      setBusy('Lendo planilha no aparelho...');
+      const base64 = await readPickedFileBase64(asset);
+      const parsed = parseWorkbookBase64(base64);
+      setWorkbookData(parsed);
+      setDatabaseFile(asset.name || 'planilha.xlsx');
+      setSheetNames(parsed.sheetNames);
+      const first = parsed.sheetNames[0] || '';
       setSheetName(first);
-      await loadSheetPreview(result.uploadId, first);
-    } catch (error: any) { showMessage(error.message); }
+      const preview = previewWorkbookSheet(parsed, first, 5);
+      setWorkbookPreview(preview);
+      setCodeColumn(preview.suggested.codeColumn || 1);
+      setNameColumn(preview.suggested.nameColumn || 2);
+      setQuantityColumn(preview.suggested.quantityColumn || 0);
+    } catch (error: any) { showMessage(error.message || 'Não foi possível ler essa planilha.'); }
     finally { setBusy(''); }
   };
 
   const onImportDatabase = async () => {
-    if (!uploadId || !sheetName) return showMessage('Selecione uma planilha e uma aba primeiro.');
-    setBusy('Importando base de referência...');
+    if (!workbookData || !sheetName) return showMessage('Selecione uma planilha e uma aba primeiro.');
+    if (!codeColumn || !nameColumn) return showMessage('Selecione as colunas de código e nome antes de importar.');
+    setBusy('Salvando a base no aparelho...');
     try {
-      const result = await apiCall<any>('/api/database/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uploadId, sheetName, mapping: { codeColumn, nameColumn, quantityColumn } }) });
-      setDatabase({ total: result.total || result.imported, ready: true, sheetName: result.sheetName, sourceFile: result.sourceFile });
-      showMessage(`${result.imported.toLocaleString('pt-BR')} itens importados da aba ${result.sheetName}.`);
+      const result = importWorkbookSheet(workbookData, sheetName, { codeColumn, nameColumn, quantityColumn }, databaseFile || 'planilha.xlsx');
+      const meta = { total: result.items.length, ready: result.items.length > 0, sheetName, sourceFile: databaseFile || 'planilha.xlsx' };
+      await persistPatch({ catalog: result.items, database: meta });
+      setCatalog(result.items);
+      setDatabase(meta);
+      setWorkbookData(null);
+      setSheetNames([]);
+      setWorkbookPreview(null);
+      setWorkflowStep('items');
+      showMessage(`${result.items.length.toLocaleString('pt-BR')} itens importados da aba ${sheetName} e salvos neste aparelho.${result.skipped ? ` ${result.skipped} linha(s) sem código ou nome foram ignoradas.` : ''}`);
     } catch (error: any) { showMessage(error.message); }
     finally { setBusy(''); }
   };
@@ -249,16 +370,20 @@ function AppScreen() {
     try {
       const asset = await chooseFile('application/vnd.openxmlformats-officedocument.presentationml.presentation');
       if (!asset) return;
-      setBusy('Analisando modelo PowerPoint...');
-      const result = await uploadPickedFile(apiUrl, '/api/templates/upload', asset);
+      setBusy('Analisando modelo PowerPoint localmente...');
+      const base64 = await readPickedFileBase64(asset);
+      const { inspectPptx } = await import('./offline/pptx');
+      const result = await inspectPptx(base64, asset.name || 'Modelo personalizado.pptx');
+      const savedTemplate = await persistPickedTemplate(asset, base64, asset.name || 'Modelo personalizado.pptx');
+      await persistPatch(savedTemplate);
       setTemplate(result);
+      setTemplateBase64(base64);
       setTemplateSlide(0);
       setCustomCodeIds('');
       setCustomNameIds('');
-      const firstSlide = result.slides?.[0];
-      const detected = (firstSlide?.capacity || 0) > 0;
+      const detected = (result.slides?.[0]?.capacity || 0) > 0;
       setTemplateError(detected ? '' : 'Não identifiquei automaticamente as caixas de código e nome. Informe os IDs das caixas no mapeamento avançado.');
-    } catch (error: any) { showMessage(error.message); }
+    } catch (error: any) { showMessage(error.message || 'Não foi possível abrir esse modelo PowerPoint.'); }
     finally { setBusy(''); }
   };
 
@@ -266,26 +391,29 @@ function AppScreen() {
     const values = splitValues(inputText);
     if (!values.length) return showMessage('Cole ou digite ao menos um código ou nome.');
     if (values.length > 1000) return showMessage('Adicione até 1.000 itens por vez.');
-    setBusy('Conferindo itens na base...');
+    setBusy('Conferindo itens na base local...');
     try {
-      const result = await apiCall<any>('/api/database/resolve', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values, mode: inputMode }) });
-      const mapped: LabelItem[] = (result.entries || []).map((entry: any) => {
-        const match = entry.item;
-        return {
-          localId: makeId(),
-          code: match?.code || (inputMode === 'code' ? entry.input : ''),
-          name: match?.name || (inputMode === 'name' ? entry.input : ''),
-          quantity: match?.quantity || '',
-          sheetName: match?.sheetName || database.sheetName,
-          sourceInput: entry.input,
-        };
+      const entries = values.map(input => {
+        const key = normalizeSearch(input);
+        const item = inputMode === 'name'
+          ? catalog.find(row => normalizeSearch(row.name) === key)
+          : catalog.find(row => normalizeSearch(row.code) === key);
+        return { input, item: item || null };
       });
+      const mapped: LabelItem[] = entries.map(entry => ({
+        localId: makeId(),
+        code: entry.item?.code || (inputMode === 'code' ? entry.input : ''),
+        name: entry.item?.name || (inputMode === 'name' ? entry.input : ''),
+        quantity: entry.item?.quantity || '',
+        sheetName: entry.item?.sheetName || database.sheetName,
+        sourceInput: entry.input,
+      }));
       setLabels(previous => [...previous, ...mapped]);
       setActiveLabelIndex(labels.length);
       setInputText('');
       setSuggestions([]);
-      const missing = (result.entries || []).filter((entry: any) => !entry.item).length;
-      if (missing) showMessage(`${mapped.length - missing} item(ns) encontrado(s). ${missing} precisa(m) de revisão manual.`);
+      const missing = entries.filter(entry => !entry.item).length;
+      if (missing) showMessage(`${mapped.length - missing} item(ns) encontrado(s) na base local. ${missing} precisa(m) de revisão manual.`);
     } catch (error: any) { showMessage(error.message); }
     finally { setBusy(''); }
   };
@@ -309,40 +437,53 @@ function AppScreen() {
     const value = current.join(', ');
     if (field === 'code') setCustomCodeIds(value); else setCustomNameIds(value);
   };
-
   const useFields = () => {
     if (!validCustomFields) return showMessage('Informe a lista de IDs das caixas de código e de nome.');
-    setTemplateError('Mapeamento manual aplicado. Confira a prévia antes de exportar.');
+    if (!selectedSlide) return showMessage('Carregue um modelo PowerPoint primeiro.');
+    const known = new Set(selectedSlide.shapes.map(shape => String(shape.id)));
+    const codeIds = parseShapeIds(customCodeIds);
+    const nameIds = parseShapeIds(customNameIds);
+    const unknown = [...codeIds, ...nameIds].filter(id => !known.has(id));
+    if (unknown.length) return showMessage(`Estes IDs não foram encontrados no slide: ${[...new Set(unknown)].join(', ')}.`);
+    if (new Set(codeIds).size !== codeIds.length || new Set(nameIds).size !== nameIds.length) return showMessage('Remova os IDs repetidos do mapeamento.');
+    if (codeIds.some(id => nameIds.includes(id))) return showMessage('Uma mesma caixa não pode ser usada como código e nome.');
+    setTemplateError('Mapeamento manual aplicado. A prévia já usa os campos selecionados.');
   };
 
   const exportFile = async (format: 'pptx' | 'pdf') => {
     if (!labels.length) return showMessage('Adicione itens antes de gerar as plaquetas.');
-    if (!template) return showMessage('Nenhum modelo PowerPoint está configurado.');
-    const ids = (value: string) => value.split(/[\s,;]+/).map(v => v.trim()).filter(Boolean);
-    const fields = validCustomFields ? { codeShapeIds: ids(customCodeIds), nameShapeIds: ids(customNameIds) } : {};
-    setBusy(format === 'pdf' ? 'Montando PDF de impressão...' : 'Montando PowerPoint...');
+    if (!template || !templateBase64) return showMessage('Nenhum modelo PowerPoint está configurado.');
+    const fields = validCustomFields ? { codeShapeIds: parseShapeIds(customCodeIds), nameShapeIds: parseShapeIds(customNameIds) } : {};
+    setBusy(format === 'pdf' ? 'Montando PDF neste aparelho...' : 'Montando PowerPoint neste aparelho...');
     try {
-      const result = await apiCall<ExportResult>('/api/export', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          templateId: template.templateId || 'default', slideIndex: templateSlide,
-          items: labels.map(({ code, name }) => ({ code, name })),
-          requestedPages: requestedPages ? Number(requestedPages) : undefined,
-          fields, format, fileName: 'plaquetas-by-lippe'
-        })
-      });
-      setLastExport(result);
-      const url = `${apiUrl.replace(/\/$/, '')}${result.downloadUrl}`;
-      if (Platform.OS === 'web') {
-        window.open(url, '_blank');
+      const items = labels.map(({ code, name }) => ({ code, name }));
+      const minimumPages = Math.max(1, Math.ceil(items.length / Math.max(capacity, 1)));
+      const pageCount = Math.max(minimumPages, Math.min(100, Number(requestedPages) || minimumPages));
+      const slide = selectedSlide;
+      if (!slide) throw new Error('O slide/modelo escolhido não existe no arquivo.');
+      if (format === 'pptx') {
+        const result = await buildPptx(templateBase64, templateSlide, items, requestedPages ? Number(requestedPages) : undefined, fields, activeAdjustments);
+        const fileName = `plaquetas-by-lippe-${Date.now()}.pptx`;
+        setLastExport({ fileName, format: 'pptx', pages: result.pages, capacity: result.capacity, printedItems: result.printedItems, remainingItems: result.remainingItems });
+        await saveAndShareBase64(result.base64, fileName, 'application/vnd.openxmlformats-officedocument.presentationml.presentation');
+        if (result.remainingItems > 0) showMessage(`${result.printedItems} plaquetas incluídas. ${result.remainingItems} ficaram fora do total de folhas escolhido.`);
       } else {
-        const localUri = `${FileSystem.cacheDirectory || ''}${result.fileName}`;
-        const downloaded = await FileSystem.downloadAsync(url, localUri);
-        if (await Sharing.isAvailableAsync()) await Sharing.shareAsync(downloaded.uri);
-        else await Linking.openURL(url);
+        const html = buildLabelsPdfHtml(items, { pages: pageCount, capacity: slide.capacity || manualCapacity || 8, orientation: slide.orientation, fileTitle: 'Plaquetas by Lippe', adjustments: activeAdjustments });
+        if (Platform.OS === 'web') {
+          const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+          const url = URL.createObjectURL(blob);
+          window.open(url, '_blank');
+          setLastExport({ fileName: 'plaquetas-by-lippe.html (imprimir como PDF)', format: 'pdf', pages: pageCount, capacity: slide.capacity || manualCapacity, printedItems: Math.min(items.length, pageCount * capacity), remainingItems: Math.max(0, items.length - pageCount * capacity) });
+          showMessage('A visualização foi aberta. Use a opção Imprimir do navegador e escolha Salvar como PDF.');
+        } else {
+          const pdf = await Print.printToFileAsync({ html, width: slide.orientation === 'portrait' ? 595 : 842, height: slide.orientation === 'portrait' ? 842 : 595, margins: { left: 0, top: 0, right: 0, bottom: 0 } });
+          const fileName = `plaquetas-by-lippe-${Date.now()}.pdf`;
+          setLastExport({ fileName, format: 'pdf', pages: pageCount, capacity: slide.capacity || manualCapacity, printedItems: Math.min(items.length, pageCount * capacity), remainingItems: Math.max(0, items.length - pageCount * capacity) });
+          if (await Sharing.isAvailableAsync()) await Sharing.shareAsync(pdf.uri, { mimeType: 'application/pdf', dialogTitle: `Compartilhar ${fileName}` });
+          else showMessage(`PDF criado: ${pdf.uri}`);
+        }
       }
-      if (result.remainingItems > 0) showMessage(`${result.printedItems} plaquetas incluídas. ${result.remainingItems} ficaram fora do total de folhas escolhido.`);
-    } catch (error: any) { showMessage(error.message); }
+    } catch (error: any) { showMessage(error.message || 'Não foi possível gerar o arquivo.'); }
     finally { setBusy(''); }
   };
 
@@ -351,244 +492,263 @@ function AppScreen() {
     if (!data || (lastScan.current.code === data && now - lastScan.current.at < 1800)) return;
     lastScan.current = { code: data, at: now };
     setScanCode(data);
-    try {
-      const result = await apiCall<any>(`/api/database/search?mode=code&q=${encodeURIComponent(data)}`);
-      const found = result.results?.find((item: CatalogItem) => item.code === data) || result.results?.[0];
-      setScanName(found?.name || 'Item não encontrado na base');
-    } catch { setScanName('Não foi possível consultar a base.'); }
-  };
-  const incrementCount = async () => {
-    if (!scanCode.trim()) return showMessage('Leia um código ou digite o código do produto.');
-    try {
-      setBusy('Atualizando contagem...');
-      await apiCall('/api/counts/increment', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: scanCode.trim(), name: scanName, amount: scanStep }) });
-      await refreshCounts();
-    } catch (error: any) { showMessage(error.message); }
-    finally { setBusy(''); }
+    const key = normalizeSearch(data);
+    const found = catalog.find(item => normalizeSearch(item.code) === key) || catalog.find(item => normalizeSearch(item.code).includes(key));
+    setScanName(found?.name || 'Item não encontrado na base local');
   };
 
-  const openSettings = () => setSettingsOpen(value => !value);
-  const applyApi = async () => {
-    const value = apiEdit.trim().replace(/\/$/, '');
-    if (value && !/^https?:\/\//i.test(value)) return showMessage('Informe uma URL começando com https:// ou http://.');
-    setApiUrl(value);
-    setSettingsOpen(false);
+  const incrementCount = async () => {
+    const code = scanCode.trim();
+    if (!code) return showMessage('Leia um código ou digite o código do produto.');
+    try {
+      setBusy('Salvando contagem local...');
+      const key = normalizeSearch(code);
+      const existing = counts.find(item => normalizeSearch(item.code) === key);
+      const found = catalog.find(item => normalizeSearch(item.code) === key);
+      const current = Number(String(existing?.quantity || '0').replace(',', '.')) || 0;
+      const nextItem: CatalogItem = {
+        code,
+        name: found?.name || scanName || existing?.name || 'Item sem descrição',
+        quantity: String(current + scanStep),
+      };
+      const nextCounts = existing
+        ? counts.map(item => normalizeSearch(item.code) === key ? nextItem : item)
+        : [...counts, nextItem];
+      nextCounts.sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+      await persistPatch({ counts: nextCounts });
+      setCounts(nextCounts);
+    } catch (error: any) { showMessage(error.message || 'Não foi possível salvar a contagem local.'); }
+    finally { setBusy(''); }
   };
 
   const pageLabel = useMemo(() => `${requiredPages} ${requiredPages === 1 ? 'folha' : 'folhas'}`, [requiredPages]);
 
-  return <View style={styles.screen}>
-    <StatusBar barStyle="dark-content" backgroundColor="#F4F7F4" />
-    <View style={styles.topBar}>
-      <View style={styles.brandMark}><Ionicons name="pricetag" size={22} color="#FFFFFF" /></View>
+  return <View style={[styles.screen, { backgroundColor: theme.background }]}>
+    <StatusBar barStyle="dark-content" backgroundColor={theme.background} />
+    <View style={[styles.topBar, { backgroundColor: theme.surface, borderBottomColor: theme.surfaceVariant }]}>
+      <View style={[styles.brandMark, { backgroundColor: theme.primary, borderRadius: 15 }]}><Ionicons name="pricetag" size={22} color={theme.onPrimary} /></View>
       <View style={{ flex: 1 }}>
         <Text style={styles.brandTitle}>PLAQUETAS <Text style={styles.brandMuted}>by lippe</Text></Text>
-        <Text style={styles.brandSubtitle}>IDENTIFICAÇÃO · ESTOQUE</Text>
+        <Text style={styles.brandSubtitle}>SEU ESTOQUE · NO PRÓPRIO APARELHO</Text>
       </View>
-      <Pressable onPress={openSettings} style={styles.iconButton}><Ionicons name="settings-outline" size={20} color={INK} /></Pressable>
-      <View style={[styles.connectionDot, apiReady ? styles.dotOn : styles.dotOff]} />
-    </View>
-
-    {settingsOpen && <View style={styles.settingsPanel}>
-      <Text style={styles.settingsTitle}>Conexão com o servidor</Text>
-      <TextInput value={apiEdit} onChangeText={setApiEdit} placeholder="https://plaquetas-by-lippe.onrender.com" autoCapitalize="none" autoCorrect={false} keyboardType="url" style={styles.textInput} />
-      <View style={styles.rowActions}><ActionButton title="Aplicar URL" onPress={applyApi} small /><ActionButton title="Fechar" onPress={openSettings} secondary small /></View>
-      <Text style={styles.helper}>Use a URL HTTPS pública do serviço no Render. O endereço padrão já aponta para o serviço configurado neste projeto.</Text>
-    </View>}
-
-    <View style={styles.tabBar}>
-      <Pressable onPress={() => setTab('labels')} style={[styles.tab, tab === 'labels' && styles.tabActive]}>
-        <Ionicons name="pricetags-outline" size={17} color={tab === 'labels' ? GREEN : MUTED} />
-        <Text style={[styles.tabText, tab === 'labels' && styles.tabTextActive]}>Gerar plaquetas</Text>
+      <View style={[styles.offlineTag, { backgroundColor: theme.primaryContainer }]}><Ionicons name="phone-portrait-outline" size={13} color={theme.primary} /><Text style={[styles.offlineTagText, { color: theme.primary }]}>OFFLINE</Text></View>
+      <Pressable onPress={() => setThemePickerOpen(value => !value)} style={[styles.themeOpenButton, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant }]}>
+        <Ionicons name="color-palette-outline" size={20} color={theme.primary} />
       </Pressable>
-      <Pressable onPress={() => setTab('count')} style={[styles.tab, tab === 'count' && styles.tabActive]}>
-        <Ionicons name="scan-outline" size={17} color={tab === 'count' ? GREEN : MUTED} />
-        <Text style={[styles.tabText, tab === 'count' && styles.tabTextActive]}>Contagem</Text>
-        <Text style={styles.betaTag}>BETA</Text>
+    </View>
+    {themePickerOpen && <View style={[styles.themePickerPanel, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]}>
+      <View style={{ flex: 1, gap: 2 }}><Text style={styles.fieldLabel}>Aparência</Text><Text style={styles.helper}>Escolha uma paleta clara Material You</Text></View>
+      <View style={styles.themeSwatches}>{APP_THEMES.map(option => <Pressable key={option.id} onPress={() => selectTheme(option.id)} accessibilityLabel={`Tema ${option.name}`} style={[styles.themeSwatch, { backgroundColor: option.primary, borderColor: themeId === option.id ? INK : option.primary }]}>{themeId === option.id ? <Ionicons name="checkmark" size={17} color="#FFFFFF" /> : null}</Pressable>)}</View>
+    </View>}
+    <View style={[styles.tabBar, { backgroundColor: theme.surface, borderBottomColor: theme.surfaceVariant }]}>
+      <Pressable onPress={() => setTab('labels')} style={[styles.tab, tab === 'labels' && { backgroundColor: theme.primaryContainer, borderRadius: 18 }]}>
+        <Ionicons name="pricetags-outline" size={18} color={tab === 'labels' ? theme.primary : MUTED} />
+        <Text style={[styles.tabText, tab === 'labels' && { color: theme.primary }]}>Criar plaquetas</Text>
+      </Pressable>
+      <Pressable onPress={() => setTab('count')} style={[styles.tab, tab === 'count' && { backgroundColor: theme.primaryContainer, borderRadius: 18 }]}>
+        <Ionicons name="scan-outline" size={18} color={tab === 'count' ? theme.primary : MUTED} />
+        <Text style={[styles.tabText, tab === 'count' && { color: theme.primary }]}>Contagem</Text>
       </Pressable>
     </View>
 
-    {!apiReady && <View style={styles.apiWarning}>
-      <Ionicons name="cloud-offline-outline" size={20} color="#A45B18" />
-      <View style={{ flex: 1 }}><Text style={styles.apiWarningTitle}>Servidor não conectado</Text><Text style={styles.apiWarningText}>A interface abriu, mas a base, os modelos e as exportações dependem do servidor. Confira a URL HTTPS nas configurações.</Text></View>
-      <ActionButton title="Configurar" onPress={() => setSettingsOpen(true)} secondary small />
-    </View>}
-
-    {tab === 'labels' ? <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
-      <View style={styles.heroRow}>
-        <View style={{ flex: 1 }}>
-          <Text style={styles.heroEyebrow}>CENTRAL DE ETIQUETAS</Text>
-          <Text style={styles.heroTitle}>Prepare suas plaquetas.</Text>
-          <Text style={styles.heroText}>Use sua planilha como referência, confira os dados e exporte no modelo original.</Text>
+    {tab === 'labels' ? <ScrollView contentContainerStyle={[styles.content, { paddingBottom: 36 }]} keyboardShouldPersistTaps="handled">
+      <View style={[styles.heroRow, { backgroundColor: theme.primaryContainer, borderRadius: 24, padding: 18, marginBottom: 14 }]}>
+        <View style={{ flex: 1, gap: 5 }}>
+          <Text style={[styles.heroEyebrow, { color: theme.primary }]}>CRIADOR DE PLAQUETAS · 100% LOCAL</Text>
+          <Text style={[styles.heroTitle, { color: theme.onPrimaryContainer }]}>Vamos preparar suas plaquetas.</Text>
+          <Text style={[styles.heroText, { color: theme.onPrimaryContainer, opacity: 0.78 }]}>Importe a base, escolha os itens, confira o modelo e exporte. Tudo funciona sem servidor.</Text>
         </View>
-        <View style={styles.heroIcon}><Ionicons name="albums-outline" size={34} color={GREEN} /></View>
+        <View style={[styles.heroIcon, { backgroundColor: `${theme.surface}B8` }]}><Ionicons name="pricetags" size={32} color={theme.primary} /></View>
       </View>
 
       <View style={styles.statRow}>
-        <View style={styles.statCard}><Text style={styles.statLabel}>ITENS NA BASE</Text><Text style={styles.statValue}>{database.total.toLocaleString('pt-BR')}</Text><Text style={styles.statFoot}>{database.ready ? 'Base pronta' : 'Sem base importada'}</Text></View>
-        <View style={styles.statCard}><Text style={styles.statLabel}>NA FILA</Text><Text style={styles.statValue}>{labels.length}</Text><Text style={styles.statFoot}>Plaquetas adicionadas</Text></View>
-        <View style={styles.statCard}><Text style={styles.statLabel}>FOLHAS</Text><Text style={styles.statValue}>{labels.length ? requiredPages : '—'}</Text><Text style={styles.statFoot}>{capacity} por folha</Text></View>
+        <View style={[styles.statCard, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]}><Text style={styles.statLabel}>NA BASE</Text><Text style={[styles.statValue, { color: theme.primary }]}>{database.total.toLocaleString('pt-BR')}</Text><Text style={styles.statFoot}>{database.ready ? 'Materiais salvos' : 'Importe o Excel'}</Text></View>
+        <View style={[styles.statCard, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]}><Text style={styles.statLabel}>NA LISTA</Text><Text style={[styles.statValue, { color: theme.primary }]}>{labels.length}</Text><Text style={styles.statFoot}>Plaquetas preparadas</Text></View>
+        <View style={[styles.statCard, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]}><Text style={styles.statLabel}>FOLHAS</Text><Text style={[styles.statValue, { color: theme.primary }]}>{labels.length ? requiredPages : '—'}</Text><Text style={styles.statFoot}>{capacity} por folha</Text></View>
       </View>
 
-      <View style={[styles.mainGrid, width < 960 && styles.mainGridMobile]}>
-        <View style={[styles.leftColumn, width < 960 && styles.columnMobile]}>
-          <Card>
-            <SectionTitle eyebrow="01 · REFERÊNCIA" title="Banco de dados" subtitle="Envie o Excel e escolha a aba que contém os itens." />
-            <View style={styles.uploadRow}>
-              <View style={styles.uploadIcon}><Ionicons name="file-tray-full-outline" size={22} color={GREEN} /></View>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.uploadTitle}>{databaseFile || database.sourceFile || 'Nenhuma planilha selecionada'}</Text>
-                <Text style={styles.helper}>{database.ready ? `${database.total.toLocaleString('pt-BR')} registros · ${database.sheetName}` : 'Formato aceito: .xlsx com uma ou mais abas'} · A importação substitui a base ativa</Text>
-              </View>
-              <ActionButton title="Enviar Excel" onPress={onChooseDatabase} secondary small disabled={!!busy} />
-            </View>
-            {sheetNames.length > 0 && <View style={styles.mappingBlock}>
-              <Text style={styles.fieldLabel}>Aba do Excel</Text>
-              <View style={styles.pickerWrap}><Picker selectedValue={sheetName} onValueChange={(value) => { setSheetName(value); loadSheetPreview(uploadId, value); }} style={styles.picker}><Picker.Item label="Selecione a aba" value="" />{sheetNames.map(name => <Picker.Item key={name} label={name} value={name} />)}</Picker></View>
-              {workbookPreview && <>
-                <Text style={styles.fieldLabel}>Mapeamento das colunas</Text>
-                <View style={[styles.mappingRow, width < 550 && styles.mappingRowMobile]}>
-                  <View style={styles.mappingField}><Text style={styles.miniLabel}>CÓDIGO</Text><View style={styles.pickerWrap}><Picker selectedValue={codeColumn} onValueChange={setCodeColumn} style={styles.picker}>{workbookPreview.columns.map(c => <Picker.Item key={c.index} label={`${c.index}. ${c.label}`} value={c.index} />)}</Picker></View></View>
-                  <View style={styles.mappingField}><Text style={styles.miniLabel}>NOME / DESCRIÇÃO</Text><View style={styles.pickerWrap}><Picker selectedValue={nameColumn} onValueChange={setNameColumn} style={styles.picker}>{workbookPreview.columns.map(c => <Picker.Item key={c.index} label={`${c.index}. ${c.label}`} value={c.index} />)}</Picker></View></View>
-                  <View style={styles.mappingField}><Text style={styles.miniLabel}>QUANTIDADE</Text><View style={styles.pickerWrap}><Picker selectedValue={quantityColumn} onValueChange={setQuantityColumn} style={styles.picker}><Picker.Item label="Não importar" value={0} />{workbookPreview.columns.map(c => <Picker.Item key={c.index} label={`${c.index}. ${c.label}`} value={c.index} />)}</Picker></View></View>
-                </View>
-                <View style={styles.previewTable}>
-                  <Text style={styles.miniLabel}>AMOSTRA DA ABA SELECIONADA</Text>
-                  <ScrollView horizontal showsHorizontalScrollIndicator>
-                    <View>
-                      <View style={styles.tableRow}>{workbookPreview.headers.slice(0, 7).map((h, i) => <Text key={i} style={styles.tableHead}>{h}</Text>)}</View>
-                      {workbookPreview.rows.slice(0, 3).map((row, ri) => <View key={ri} style={styles.tableRow}>{row.slice(0, 7).map((cell, ci) => <Text key={ci} style={styles.tableCell}>{cell || '—'}</Text>)}</View>)}
-                    </View>
-                  </ScrollView>
-                </View>
-                <ActionButton title="Importar esta aba como referência" onPress={onImportDatabase} icon="cloud-upload-outline" disabled={!!busy} />
-              </>}
-            </View>}
-          </Card>
-
-          <Card>
-            <SectionTitle eyebrow="02 · MODELO" title="Modelo da plaqueta" subtitle="O arquivo original é preservado. Só o código e o nome dos itens são trocados." />
-            <View style={styles.uploadRow}>
-              <View style={styles.uploadIcon}><Ionicons name="document-text-outline" size={22} color={GREEN} /></View>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.uploadTitle}>{template?.name || 'Carregando modelo padrão...'}</Text>
-                <Text style={styles.helper}>{template?.slides?.length || 0} modelo(s) detectado(s) · {capacity} plaquetas por folha</Text>
-              </View>
-              <ActionButton title="Trocar PPTX" onPress={onChooseTemplate} secondary small disabled={!!busy} />
-            </View>
-            {template?.slides?.length ? <>
-              <Text style={styles.fieldLabel}>Tipo de plaqueta</Text>
-              <View style={styles.sizeChoices}>{template.slides.map((slide, index) => <Pressable key={slide.index} onPress={() => { setTemplateSlide(index); setCompactPreview(index === 1); }} style={[styles.sizeChoice, templateSlide === index && styles.sizeChoiceActive]}>
-                <Ionicons name={templateSlide === index ? 'radio-button-on' : 'radio-button-off'} color={templateSlide === index ? GREEN : MUTED} size={17} />
-                <View style={{ flex: 1 }}><Text style={[styles.sizeChoiceTitle, templateSlide === index && styles.sizeChoiceTitleActive]}>{index === 0 ? 'Plaqueta maior' : index === 1 ? 'Plaqueta menor' : `Modelo ${index + 1}`}</Text><Text style={styles.sizeChoiceMeta}>{slide.capacity} por folha · {slide.orientation === 'portrait' ? 'Folha retrato' : 'Folha paisagem'}</Text></View>
-              </Pressable>)}</View>
-              {!!templateError && <Text style={styles.warningText}>{templateError}</Text>}
-              {selectedSlide && selectedSlide.capacity === 0 && <View style={styles.advancedMap}>
-                <Text style={styles.fieldLabel}>Mapeamento avançado de campos (IDs das caixas)</Text>
-                <Text style={styles.helper}>Dê às caixas os nomes name.item e cod.item no PowerPoint, ou informe os IDs detectados abaixo, separados por vírgula.</Text>
-                <Text style={styles.miniLabel}>IDs DO CÓDIGO</Text><TextInput value={customCodeIds} onChangeText={setCustomCodeIds} style={styles.textInput} placeholder="12, 26, 41..." />
-                <Text style={styles.miniLabel}>IDs DO NOME</Text><TextInput value={customNameIds} onChangeText={setCustomNameIds} style={styles.textInput} placeholder="15, 29, 44..." />
-                <Text style={styles.miniLabel}>CAIXAS DE TEXTO DETECTADAS · TOQUE PARA ATRIBUIR</Text>
-                <View style={styles.shapeList}>
-                  {selectedSlide.shapes.filter(shape => shape.text || shape.field).slice(0, 80).map(shape => <View key={shape.id} style={styles.shapeRow}>
-                    <View style={{ flex: 1 }}><Text style={styles.shapeName}>#{shape.id} · {shape.shape}</Text><Text numberOfLines={1} style={styles.helper}>{shape.text || 'Caixa vazia'}</Text></View>
-                    <Pressable onPress={() => addShapeId('code', shape.id)} style={styles.shapeAssign}><Text style={styles.shapeAssignText}>Código</Text></Pressable>
-                    <Pressable onPress={() => addShapeId('name', shape.id)} style={styles.shapeAssign}><Text style={styles.shapeAssignText}>Nome</Text></Pressable>
-                  </View>)}
-                </View>
-                <ActionButton title="Aplicar mapeamento" onPress={useFields} secondary small />
-              </View>}
-            </> : null}
-          </Card>
-
-          <Card>
-            <SectionTitle eyebrow="03 · ITENS" title="Adicionar à lista" subtitle="Cole vários códigos ou nomes. Um item por linha, ou separados por vírgula." />
-            <View style={styles.segmented}>
-              <Pressable onPress={() => { setInputMode('code'); setSuggestions([]); }} style={[styles.segment, inputMode === 'code' && styles.segmentActive]}><Text style={[styles.segmentText, inputMode === 'code' && styles.segmentTextActive]}>Códigos</Text></Pressable>
-              <Pressable onPress={() => { setInputMode('name'); setSuggestions([]); }} style={[styles.segment, inputMode === 'name' && styles.segmentActive]}><Text style={[styles.segmentText, inputMode === 'name' && styles.segmentTextActive]}>Nomes</Text></Pressable>
-            </View>
-            <TextInput value={inputText} onChangeText={setInputText} multiline textAlignVertical="top" placeholder={inputMode === 'code' ? 'Ex.:\n76120200487\n76150100651\n76100301045' : 'Digite o nome do item para pesquisar na base...'} style={[styles.textInput, styles.listInput]} />
-            {inputMode === 'name' && suggestions.length > 0 && <View style={styles.suggestionPanel}>
-              {suggestions.slice(0, 5).map((item, i) => <Pressable key={`${item.code}-${i}`} onPress={() => chooseSuggestion(item)} style={styles.suggestionRow}>
-                <View style={{ flex: 1 }}><Text style={styles.suggestionName}>{item.name}</Text><Text style={styles.helper}>Código: {item.code} · Estoque: {item.quantity || '—'}</Text></View><Ionicons name="add-circle-outline" size={20} color={GREEN} />
-              </Pressable>)}
-            </View>}
-            <View style={styles.rowActions}><ActionButton title="Adicionar itens" onPress={addItems} icon="add" disabled={!!busy || !apiReady} /><Text style={styles.helper}>Até 1.000 por envio</Text></View>
-          </Card>
-        </View>
-
-        <View style={[styles.rightColumn, width < 960 && styles.columnMobile]}>
-          <Card>
-            <SectionTitle eyebrow="PRÉVIA INDIVIDUAL" title="Sua plaqueta" subtitle="A visualização mostra apenas uma unidade, não a folha inteira." />
-            <View style={styles.previewControls}>
-              <Pressable onPress={() => setCompactPreview(false)} style={[styles.previewToggle, !compactPreview && styles.previewToggleActive]}><Text style={[styles.previewToggleText, !compactPreview && styles.previewToggleTextActive]}>Maior</Text></Pressable>
-              <Pressable onPress={() => setCompactPreview(true)} style={[styles.previewToggle, compactPreview && styles.previewToggleActive]}><Text style={[styles.previewToggleText, compactPreview && styles.previewToggleTextActive]}>Menor</Text></Pressable>
-            </View>
-            <View style={styles.labelStage}>
-              <View style={[styles.labelPreview, compactPreview && styles.labelPreviewCompact]}>
-                <View style={styles.labelTop}>
-                  <View style={styles.logoCell}><Text style={styles.logoText}>CKTR</Text><Text style={styles.logoSub}>SERVIÇOS</Text></View>
-                  <View style={styles.codeCell}><Text style={styles.labelSmall}>Código:</Text><Text numberOfLines={1} adjustsFontSizeToFit style={styles.labelCode}>{activeLabel?.code || '14.112.000'}</Text></View>
-                </View>
-                <View style={styles.itemCell}><Text style={styles.labelSmall}>Item:</Text><Text numberOfLines={compactPreview ? 3 : 4} adjustsFontSizeToFit style={styles.labelName}>{activeLabel?.name || 'NOME DO ITEM SELECIONADO'}</Text></View>
-                <View style={styles.labelBottom}><View style={styles.bottomCell}><Text style={styles.labelSmall}>Quantidade:</Text></View><View style={styles.bottomCell}><Text style={styles.labelSmall}>Data de contagem:</Text></View></View>
-              </View>
-              <Text style={styles.helper}>Prévia ilustrativa. O arquivo exportado usa o layout exato do PowerPoint enviado.</Text>
-            </View>
-            <View style={styles.labelNav}>
-              <Pressable onPress={() => setActiveLabelIndex(i => Math.max(0, i - 1))} disabled={activeLabelIndex <= 0} style={styles.navCircle}><Ionicons name="chevron-back" size={18} color={INK} /></Pressable>
-              <Text style={styles.navCount}>{labels.length ? `${Math.min(activeLabelIndex + 1, labels.length)} de ${labels.length}` : 'Sem itens'}</Text>
-              <Pressable onPress={() => setActiveLabelIndex(i => Math.min(labels.length - 1, i + 1))} disabled={activeLabelIndex >= labels.length - 1} style={styles.navCircle}><Ionicons name="chevron-forward" size={18} color={INK} /></Pressable>
-            </View>
-          </Card>
-
-          <Card>
-            <SectionTitle eyebrow="04 · REVISÃO" title={`Lista de plaquetas (${labels.length})`} subtitle="Você pode corrigir qualquer código ou nome antes de gerar o arquivo." />
-            {labels.length === 0 ? <View style={styles.emptyState}><Ionicons name="file-tray-outline" size={29} color="#A7B4AC" /><Text style={styles.emptyTitle}>Sua lista está vazia</Text><Text style={styles.helper}>Adicione códigos ou nomes no painel ao lado.</Text></View> : <View style={styles.itemList}>
-              {labels.map((item, index) => <View key={item.localId} style={styles.itemEditor}>
-                <View style={styles.itemEditorTop}><Text style={styles.itemNumber}>#{String(index + 1).padStart(2, '0')}</Text><Text style={styles.itemStock}>Estoque: {item.quantity || '—'} · Aba: {item.sheetName || database.sheetName || '—'}</Text><Pressable onPress={() => removeLabel(item.localId)} hitSlop={8}><Ionicons name="trash-outline" size={17} color="#A95C54" /></Pressable></View>
-                <Text style={styles.miniLabel}>CÓDIGO</Text><TextInput value={item.code} onChangeText={v => updateLabel(item.localId, 'code', v)} style={styles.editInput} />
-                <Text style={styles.miniLabel}>NOME DO ITEM</Text><TextInput value={item.name} onChangeText={v => updateLabel(item.localId, 'name', v)} style={styles.editInput} />
-                {!item.code || !item.name ? <Text style={styles.warningText}>Preencha o código e o nome antes de imprimir.</Text> : null}
-                <Pressable onPress={() => setActiveLabelIndex(index)} style={styles.showPreviewLink}><Ionicons name="eye-outline" size={15} color={GREEN} /><Text style={styles.showPreviewText}>Visualizar esta plaqueta</Text></Pressable>
-              </View>)}
-            </View>}
-            <View style={styles.exportBox}>
-              <Text style={styles.exportTitle}>Folhas para impressão</Text>
-              <View style={styles.exportRow}><View style={{ flex: 1 }}><Text style={styles.helper}>Mínimo automático: {pageLabel} · {capacity} plaquetas por folha.</Text></View><View style={styles.pageInputWrap}><Text style={styles.miniLabel}>FOLHAS</Text><TextInput keyboardType="number-pad" value={requestedPages} onChangeText={setRequestedPages} placeholder={String(requiredPages)} style={styles.pageInput} /></View></View>
-              <ActionButton title="Visualizar arquivo completo (PDF)" onPress={() => exportFile('pdf')} icon="eye-outline" disabled={!!busy || !labels.length || !apiReady} />
-              <View style={styles.exportButtons}><View style={{ flex: 1 }}><ActionButton title="Baixar PDF" onPress={() => exportFile('pdf')} secondary icon="download-outline" small disabled={!!busy || !labels.length || !apiReady} /></View><View style={{ flex: 1 }}><ActionButton title="Baixar PPTX" onPress={() => exportFile('pptx')} secondary icon="document-outline" small disabled={!!busy || !labels.length || !apiReady} /></View></View>
-              {lastExport && <Text style={styles.successText}><Ionicons name="checkmark-circle" size={14} color={GREEN} /> Último arquivo: {lastExport.fileName} · {lastExport.pages} folha(s)</Text>}
-            </View>
-          </Card>
-        </View>
+      <View style={[styles.workflowTabs, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant }]}>
+        {([
+          { key: 'data', number: '1', title: 'Base', icon: 'file-tray-full-outline' },
+          { key: 'items', number: '2', title: 'Itens', icon: 'list-outline' },
+          { key: 'layout', number: '3', title: 'Modelo', icon: 'options-outline' },
+        ] as const).map(step => {
+          const active = workflowStep === step.key;
+          const done = (step.key === 'data' && database.ready) || (step.key === 'items' && labels.length > 0);
+          return <Pressable key={step.key} onPress={() => setWorkflowStep(step.key)} style={[styles.workflowStep, active && { backgroundColor: theme.surface, borderColor: theme.primary }, !active && { borderColor: 'transparent' }]}>
+            <View style={[styles.workflowNumber, { backgroundColor: active ? theme.primary : done ? theme.primaryContainer : theme.surfaceVariant }]}><Text style={{ color: active ? theme.onPrimary : theme.primary, fontSize: 12, fontWeight: '800' }}>{done && !active ? '✓' : step.number}</Text></View>
+            <Text style={[styles.workflowStepText, { color: active ? theme.primary : MUTED }]}>{step.title}</Text>
+          </Pressable>;
+        })}
       </View>
-      <View style={styles.footer}><Text style={styles.footerText}>PLAQUETAS BY LIPPE · PROJETO INDEPENDENTE</Text><Text style={styles.footerText}>O PowerPoint original é mantido sem alterações de fonte, tamanho ou formatação.</Text></View>
-    </ScrollView> : <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
-      <View style={styles.heroRow}><View style={{ flex: 1 }}><Text style={styles.heroEyebrow}>INVENTÁRIO · CONTAGEM</Text><Text style={styles.heroTitle}>Conte sem perder o ritmo.</Text><Text style={styles.heroText}>Leia o código do item e conte em unidades ou em lotes de dez.</Text></View><View style={styles.heroIcon}><Ionicons name="scan-circle-outline" size={36} color={GREEN} /></View></View>
+
+      {workflowStep === 'data' && <Card style={[styles.materialCard, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]}>
+        <SectionTitle eyebrow="PASSO 1 DE 3" title="Sua base de materiais" subtitle="A planilha fica armazenada apenas neste aparelho. Não é enviada para nenhum servidor." accent={theme.primary} />
+        <View style={[styles.materialFileRow, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant }]}>
+          <View style={[styles.materialIconCircle, { backgroundColor: theme.primaryContainer }]}><Ionicons name="document-text-outline" size={24} color={theme.primary} /></View>
+          <View style={{ flex: 1, gap: 3 }}>
+            <Text style={styles.uploadTitle}>{databaseFile || database.sourceFile || 'Nenhuma planilha selecionada'}</Text>
+            <Text style={styles.helper}>{database.ready ? `${database.total.toLocaleString('pt-BR')} registros · ${database.sheetName}` : 'Planilha Excel .xlsx com uma ou mais abas'}</Text>
+          </View>
+        </View>
+        <ActionButton title={database.ready ? 'Trocar planilha Excel' : 'Selecionar planilha Excel'} onPress={onChooseDatabase} icon="folder-open-outline" primaryColor={theme.primary} disabled={!!busy} />
+        {sheetNames.length > 0 && <View style={styles.mappingBlock}>
+          <Text style={styles.fieldLabel}>1. Escolha a aba da planilha</Text>
+          <View style={[styles.pickerWrap, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant }]}><Picker selectedValue={sheetName} onValueChange={(value) => { setSheetName(value); loadSheetPreview(value); }} style={styles.picker}><Picker.Item label="Selecione a aba" value="" />{sheetNames.map(name => <Picker.Item key={name} label={name} value={name} />)}</Picker></View>
+          {workbookPreview && <>
+            <Text style={styles.fieldLabel}>2. Confira as colunas</Text>
+            <View style={[styles.mappingRow, width < 550 && styles.mappingRowMobile]}>
+              <View style={styles.mappingField}><Text style={styles.miniLabel}>CÓDIGO</Text><View style={[styles.pickerWrap, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant }]}><Picker selectedValue={codeColumn} onValueChange={setCodeColumn} style={styles.picker}>{workbookPreview.columns.map(c => <Picker.Item key={c.index} label={`${c.index}. ${c.label}`} value={c.index} />)}</Picker></View></View>
+              <View style={styles.mappingField}><Text style={styles.miniLabel}>NOME / DESCRIÇÃO</Text><View style={[styles.pickerWrap, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant }]}><Picker selectedValue={nameColumn} onValueChange={setNameColumn} style={styles.picker}>{workbookPreview.columns.map(c => <Picker.Item key={c.index} label={`${c.index}. ${c.label}`} value={c.index} />)}</Picker></View></View>
+              <View style={styles.mappingField}><Text style={styles.miniLabel}>QUANTIDADE</Text><View style={[styles.pickerWrap, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant }]}><Picker selectedValue={quantityColumn} onValueChange={setQuantityColumn} style={styles.picker}><Picker.Item label="Não importar" value={0} />{workbookPreview.columns.map(c => <Picker.Item key={c.index} label={`${c.index}. ${c.label}`} value={c.index} />)}</Picker></View></View>
+            </View>
+            <View style={[styles.previewTable, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]}>
+              <Text style={styles.miniLabel}>AMOSTRA DOS DADOS</Text>
+              <ScrollView horizontal showsHorizontalScrollIndicator><View>
+                <View style={styles.tableRow}>{workbookPreview.headers.slice(0, 7).map((h, i) => <Text key={i} style={[styles.tableHead, { color: theme.primary, backgroundColor: theme.primaryContainer }]}>{h}</Text>)}</View>
+                {workbookPreview.rows.slice(0, 3).map((row, ri) => <View key={ri} style={styles.tableRow}>{row.slice(0, 7).map((cell, ci) => <Text key={ci} style={styles.tableCell}>{cell || '—'}</Text>)}</View>)}
+              </View></ScrollView>
+            </View>
+            <ActionButton title="Salvar base neste aparelho" onPress={onImportDatabase} icon="save-outline" primaryColor={theme.primary} disabled={!!busy} />
+          </>}
+        </View>}
+        {database.ready && <View style={[styles.inlineSuccess, { backgroundColor: theme.primaryContainer }]}><Ionicons name="checkmark-circle" size={18} color={theme.primary} /><Text style={[styles.inlineSuccessText, { color: theme.onPrimaryContainer }]}>Base salva localmente e disponível mesmo sem internet.</Text></View>}
+        <View style={styles.stepFooter}>
+          <View style={{ flex: 1 }}><Text style={styles.helper}>Você pode continuar sem importar uma planilha e digitar os itens manualmente.</Text></View>
+          <ActionButton title="Continuar" onPress={() => setWorkflowStep('items')} icon="arrow-forward" primaryColor={theme.primary} />
+        </View>
+      </Card>}
+
+      {workflowStep === 'items' && <Card style={[styles.materialCard, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]}>
+        <SectionTitle eyebrow="PASSO 2 DE 3" title="Quais plaquetas você precisa?" subtitle="Digite ou cole uma lista. O app procura os códigos e nomes na base salva no celular." accent={theme.primary} />
+        <View style={[styles.segmented, { backgroundColor: theme.surfaceContainer }]}>
+          <Pressable onPress={() => { setInputMode('code'); setSuggestions([]); }} style={[styles.segment, inputMode === 'code' && { backgroundColor: theme.surface, borderRadius: 12 }]}><Text style={[styles.segmentText, inputMode === 'code' && { color: theme.primary }]}>Por código</Text></Pressable>
+          <Pressable onPress={() => { setInputMode('name'); setSuggestions([]); }} style={[styles.segment, inputMode === 'name' && { backgroundColor: theme.surface, borderRadius: 12 }]}><Text style={[styles.segmentText, inputMode === 'name' && { color: theme.primary }]}>Por nome</Text></Pressable>
+        </View>
+        <TextInput value={inputText} onChangeText={setInputText} multiline textAlignVertical="top" placeholder={inputMode === 'code' ? 'Cole os códigos aqui, um por linha…\nEx.: 76120200487\n76150100651' : 'Digite parte do nome do material…'} style={[styles.textInput, styles.listInput, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant, minHeight: 126, borderRadius: 16 }]} />
+        {inputMode === 'name' && suggestions.length > 0 && <View style={[styles.suggestionPanel, { borderColor: theme.surfaceVariant, backgroundColor: theme.surface }]}>
+          {suggestions.slice(0, 6).map((item, i) => <Pressable key={`${item.code}-${i}`} onPress={() => chooseSuggestion(item)} style={styles.suggestionRow}>
+            <View style={{ flex: 1 }}><Text style={styles.suggestionName}>{item.name}</Text><Text style={styles.helper}>Código: {item.code} · Estoque: {item.quantity || '—'}</Text></View><Ionicons name="add-circle" size={21} color={theme.primary} />
+          </Pressable>)}
+        </View>}
+        <ActionButton title="Adicionar à lista" onPress={addItems} icon="add" primaryColor={theme.primary} disabled={!!busy || !localReady} />
+        <View style={[styles.listSummary, { backgroundColor: theme.surfaceContainer }]}><Text style={[styles.listSummaryTitle, { color: theme.primary }]}>{labels.length} plaqueta(s) na lista</Text><Text style={styles.helper}>{labels.length ? `Serão necessárias ${requiredPages} folha(s), com ${capacity} posições por folha.` : 'Ainda não há itens. Cole uma lista acima para começar.'}</Text></View>
+        {labels.length === 0 ? <View style={styles.emptyState}><Ionicons name="documents-outline" size={30} color={theme.outline} /><Text style={styles.emptyTitle}>Sua lista está vazia</Text><Text style={styles.helper}>Depois de adicionar, você poderá editar cada código e descrição.</Text></View> : <View style={styles.itemList}>
+          {labels.map((item, index) => <View key={item.localId} style={[styles.itemEditor, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant, borderRadius: 16 }]}>
+            <View style={styles.itemEditorTop}><Text style={[styles.itemNumber, { color: theme.primary }]}>PLAQUETA {String(index + 1).padStart(2, '0')}</Text><View style={{ flex: 1 }} /><Pressable onPress={() => removeLabel(item.localId)} hitSlop={8}><Ionicons name="trash-outline" size={18} color="#B3261E" /></Pressable></View>
+            <Text style={styles.miniLabel}>CÓDIGO</Text><TextInput value={item.code} onChangeText={v => updateLabel(item.localId, 'code', v)} style={[styles.editInput, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]} />
+            <Text style={styles.miniLabel}>NOME DO MATERIAL</Text><TextInput value={item.name} onChangeText={v => updateLabel(item.localId, 'name', v)} style={[styles.editInput, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]} />
+            {!item.code || !item.name ? <Text style={styles.warningText}>Preencha o código e o nome antes de exportar.</Text> : null}
+            <Pressable onPress={() => { setAdjustSlotIndex(index % Math.max(1, capacity)); setWorkflowStep('layout'); }} style={styles.showPreviewLink}><Ionicons name="scan-outline" size={15} color={theme.primary} /><Text style={[styles.showPreviewText, { color: theme.primary }]}>Conferir posição na prévia</Text></Pressable>
+          </View>)}
+        </View>}
+        <View style={styles.stepFooter}>
+          <ActionButton title="Voltar" onPress={() => setWorkflowStep('data')} secondary primaryColor={theme.primary} />
+          <ActionButton title="Continuar para o modelo" onPress={() => setWorkflowStep('layout')} icon="arrow-forward" primaryColor={theme.primary} />
+        </View>
+      </Card>}
+
+      {workflowStep === 'layout' && <Card style={[styles.materialCard, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]}>
+        <SectionTitle eyebrow="PASSO 3 DE 3" title="Confira e ajuste seu modelo" subtitle="Esta prévia é montada a partir do PowerPoint carregado. Toque no código ou nome para selecionar o campo e veja as mudanças na hora." accent={theme.primary} />
+        <View style={[styles.materialFileRow, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant }]}>
+          <View style={[styles.materialIconCircle, { backgroundColor: theme.primaryContainer }]}><Ionicons name="document-text-outline" size={23} color={theme.primary} /></View>
+          <View style={{ flex: 1, gap: 3 }}><Text style={styles.uploadTitle}>{template?.name || 'Carregando modelo padrão...'}</Text><Text style={styles.helper}>{template?.slides?.length || 0} modelo(s) · {capacity} posições por folha</Text></View>
+          <ActionButton title="Trocar" onPress={onChooseTemplate} secondary small primaryColor={theme.primary} disabled={!!busy} />
+        </View>
+        {template?.slides?.length ? <>
+          <Text style={styles.fieldLabel}>Escolha o tamanho de plaqueta</Text>
+          <View style={styles.sizeChoices}>{template.slides.map((slide, index) => <Pressable key={slide.index} onPress={() => { setTemplateSlide(index); setAdjustSlotIndex(0); }} style={[styles.sizeChoice, { borderColor: templateSlide === index ? theme.primary : theme.surfaceVariant, backgroundColor: templateSlide === index ? theme.primaryContainer : theme.surface }]}>
+            <Ionicons name={templateSlide === index ? 'radio-button-on' : 'radio-button-off'} color={templateSlide === index ? theme.primary : MUTED} size={17} />
+            <View style={{ flex: 1 }}><Text style={[styles.sizeChoiceTitle, { color: templateSlide === index ? theme.onPrimaryContainer : INK }]}>{index === 0 ? 'Plaqueta maior' : index === 1 ? 'Plaqueta menor' : `Modelo ${index + 1}`}</Text><Text style={styles.sizeChoiceMeta}>{slide.capacity} por folha · {slide.orientation === 'portrait' ? 'Retrato' : 'Paisagem'}</Text></View>
+          </Pressable>)}</View>
+          {!!templateError && <Text style={styles.warningText}>{templateError}</Text>}
+          {selectedSlide && selectedSlide.capacity === 0 && <View style={styles.advancedMap}>
+            <Text style={styles.fieldLabel}>Mapeamento manual</Text><Text style={styles.helper}>Use apenas se o app não reconheceu automaticamente os campos. Informe os IDs das caixas de código e nome.</Text>
+            <Text style={styles.miniLabel}>IDs DO CÓDIGO</Text><TextInput value={customCodeIds} onChangeText={setCustomCodeIds} style={styles.textInput} placeholder="12, 26, 41…" />
+            <Text style={styles.miniLabel}>IDs DO NOME</Text><TextInput value={customNameIds} onChangeText={setCustomNameIds} style={styles.textInput} placeholder="15, 29, 44…" />
+            <ActionButton title="Aplicar mapeamento" onPress={useFields} secondary primaryColor={theme.primary} small />
+          </View>}
+        </> : <Text style={styles.helper}>Preparando o modelo padrão incluído no aplicativo…</Text>}
+
+        {selectedSlide && previewSlide && <>
+          <View style={styles.previewHeader}>
+            <View style={{ flex: 1, gap: 2 }}><Text style={styles.fieldLabel}>Prévia em tempo real</Text><Text style={styles.helper}>Folha inteira · toque nos campos para selecionar</Text></View>
+            <View style={[styles.previewLiveTag, { backgroundColor: theme.primaryContainer }]}><View style={[styles.previewLiveDot, { backgroundColor: theme.primary }]} /><Text style={[styles.previewLiveText, { color: theme.onPrimaryContainer }]}>AO VIVO</Text></View>
+          </View>
+          {previewSlide.visuals?.length ? <TemplatePreview
+            slide={previewSlide}
+            labels={labels.slice(0, Math.max(1, previewSlide.capacity || capacity))}
+            adjustments={activeAdjustments}
+            activeSlot={Math.min(adjustSlotIndex, Math.max(0, previewSlide.capacity - 1))}
+            activeField={adjustField}
+            accent={theme.primary}
+            onSelectField={(slot, field) => { setAdjustSlotIndex(slot); setAdjustField(field); }}
+          /> : <View style={styles.previewFallback}><Ionicons name="image-outline" size={24} color={theme.outline} /><Text style={styles.helper}>Este modelo não possui uma prévia vetorial disponível. A exportação PowerPoint continuará usando o arquivo original.</Text></View>}
+          <View style={[styles.adjustPanel, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant }]}>
+            <View style={{ gap: 3 }}><Text style={[styles.adjustTitle, { color: theme.onPrimaryContainer }]}>Ajustar posição do texto</Text><Text style={styles.helper}>Cada toque move o campo selecionado e atualiza a prévia imediatamente.</Text></View>
+            <View style={styles.adjustSegmentRow}>
+              <Pressable onPress={() => setAdjustScope('global')} style={[styles.adjustSegment, { backgroundColor: adjustScope === 'global' ? theme.primary : theme.surface, borderColor: adjustScope === 'global' ? theme.primary : theme.surfaceVariant }]}><Text style={{ color: adjustScope === 'global' ? theme.onPrimary : INK, fontWeight: '700', fontSize: 12 }}>Todas as plaquetas</Text></Pressable>
+              <Pressable onPress={() => setAdjustScope('single')} style={[styles.adjustSegment, { backgroundColor: adjustScope === 'single' ? theme.primary : theme.surface, borderColor: adjustScope === 'single' ? theme.primary : theme.surfaceVariant }]}><Text style={{ color: adjustScope === 'single' ? theme.onPrimary : INK, fontWeight: '700', fontSize: 12 }}>Só uma plaqueta</Text></Pressable>
+            </View>
+            {adjustScope === 'single' && <View style={styles.slotPickerRow}><Text style={styles.fieldLabel}>Plaqueta</Text><View style={[styles.pickerWrap, { width: 130, backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]}><Picker selectedValue={Math.min(adjustSlotIndex, Math.max(0, capacity - 1))} onValueChange={value => setAdjustSlotIndex(Number(value))} style={styles.picker}>{Array.from({ length: Math.max(1, capacity) }, (_, i) => <Picker.Item key={i} label={`Plaqueta ${i + 1}`} value={i} />)}</Picker></View></View>}
+            <Text style={styles.fieldLabel}>Qual texto deseja mover?</Text>
+            <View style={styles.adjustSegmentRow}>
+              <Pressable onPress={() => setAdjustField('code')} style={[styles.adjustSegment, { backgroundColor: adjustField === 'code' ? theme.primaryContainer : theme.surface, borderColor: adjustField === 'code' ? theme.primary : theme.surfaceVariant }]}><Text style={{ color: adjustField === 'code' ? theme.primary : INK, fontWeight: '700', fontSize: 12 }}>Código</Text></Pressable>
+              <Pressable onPress={() => setAdjustField('name')} style={[styles.adjustSegment, { backgroundColor: adjustField === 'name' ? theme.primaryContainer : theme.surface, borderColor: adjustField === 'name' ? theme.primary : theme.surfaceVariant }]}><Text style={{ color: adjustField === 'name' ? theme.primary : INK, fontWeight: '700', fontSize: 12 }}>Nome do item</Text></Pressable>
+            </View>
+            <View style={styles.adjustStepRow}><Text style={styles.fieldLabel}>Precisão do movimento</Text>{[0.5, 1, 2, 5].map(step => <Pressable key={step} onPress={() => setAdjustStep(step)} style={[styles.adjustStepChip, { backgroundColor: adjustStep === step ? theme.primaryContainer : theme.surface, borderColor: adjustStep === step ? theme.primary : theme.surfaceVariant }]}><Text style={{ color: adjustStep === step ? theme.primary : MUTED, fontSize: 11, fontWeight: '800' }}>{step} mm</Text></Pressable>)}</View>
+            <View style={styles.dpadWrap}>
+              <View style={styles.dpadColumn}>
+                <Pressable onPress={() => updateTemplatePosition(0, -adjustStep)} style={[styles.dpadButton, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]}><Ionicons name="chevron-up" size={24} color={theme.primary} /></Pressable>
+                <View style={styles.dpadMiddle}>
+                  <Pressable onPress={() => updateTemplatePosition(-adjustStep, 0)} style={[styles.dpadButton, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]}><Ionicons name="chevron-back" size={24} color={theme.primary} /></Pressable>
+                  <View style={[styles.dpadCenter, { backgroundColor: theme.primaryContainer }]}><Ionicons name="move" size={18} color={theme.primary} /></View>
+                  <Pressable onPress={() => updateTemplatePosition(adjustStep, 0)} style={[styles.dpadButton, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]}><Ionicons name="chevron-forward" size={24} color={theme.primary} /></Pressable>
+                </View>
+                <Pressable onPress={() => updateTemplatePosition(0, adjustStep)} style={[styles.dpadButton, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]}><Ionicons name="chevron-down" size={24} color={theme.primary} /></Pressable>
+              </View>
+              <View style={styles.offsetReadout}><Text style={styles.miniLabel}>DESLOCAMENTO ATUAL</Text><Text style={[styles.offsetValue, { color: theme.primary }]}>X {Number(selectedFieldDelta?.xMm || 0).toFixed(1)} mm</Text><Text style={[styles.offsetValue, { color: theme.primary }]}>Y {Number(selectedFieldDelta?.yMm || 0).toFixed(1)} mm</Text><Text style={styles.helper}>{adjustScope === 'global' ? 'Aplicado em todas as posições do modelo.' : `Aplicado somente à plaqueta ${adjustSlotIndex + 1}.`}</Text></View>
+            </View>
+            <View style={styles.stepFooter}><View style={{ flex: 1 }}><Text style={styles.helper}>Posicione olhando a prévia. O valor será salvo neste aparelho e aplicado ao exportar.</Text></View><ActionButton title="Restaurar posição" onPress={resetTemplatePositions} secondary primaryColor={theme.primary} small /></View>
+          </View>
+        </>}
+
+        <View style={[styles.exportBox, { borderColor: theme.surfaceVariant }]}>
+          <Text style={styles.exportTitle}>Gerar arquivo</Text>
+          <View style={styles.exportRow}><View style={{ flex: 1 }}><Text style={styles.helper}>Quantidade mínima: {pageLabel} · {capacity} plaquetas por folha.</Text></View><View style={styles.pageInputWrap}><Text style={styles.miniLabel}>FOLHAS</Text><TextInput keyboardType="number-pad" value={requestedPages} onChangeText={setRequestedPages} placeholder={String(requiredPages)} style={[styles.pageInput, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant }]} /></View></View>
+          <View style={styles.exportButtons}><View style={{ flex: 1 }}><ActionButton title="Exportar PDF" onPress={() => exportFile('pdf')} icon="document-text-outline" primaryColor={theme.primary} small disabled={!!busy || !labels.length || !localReady} /></View><View style={{ flex: 1 }}><ActionButton title="Exportar PowerPoint" onPress={() => exportFile('pptx')} icon="file-tray-full-outline" primaryColor={theme.primary} small disabled={!!busy || !labels.length || !localReady} /></View></View>
+          <Text style={styles.helper}>O PowerPoint preserva o modelo original. O PDF usa uma grade de impressão simplificada com os mesmos ajustes de posição.</Text>
+          {lastExport && <Text style={[styles.successText, { color: theme.primary }]}><Ionicons name="checkmark-circle" size={14} color={theme.primary} /> Último arquivo: {lastExport.fileName} · {lastExport.pages} folha(s)</Text>}
+        </View>
+        <View style={styles.stepFooter}><ActionButton title="Voltar para os itens" onPress={() => setWorkflowStep('items')} secondary primaryColor={theme.primary} /><Text style={styles.helper}>Seu modelo e ajustes ficam salvos no aparelho.</Text></View>
+      </Card>}
+
+      <View style={styles.footer}><Text style={styles.footerText}>PLAQUETAS BY LIPPE · MATERIAL YOU</Text><Text style={styles.footerText}>Arquivos, base, preferências e ajustes ficam armazenados localmente.</Text></View>
+    </ScrollView> : <ScrollView contentContainerStyle={[styles.content, { backgroundColor: theme.background }]} keyboardShouldPersistTaps="handled">
+      <View style={[styles.heroRow, { backgroundColor: theme.primaryContainer, borderRadius: 24, padding: 18, marginBottom: 14 }]}><View style={{ flex: 1, gap: 5 }}><Text style={[styles.heroEyebrow, { color: theme.primary }]}>INVENTÁRIO · CONTAGEM</Text><Text style={[styles.heroTitle, { color: theme.onPrimaryContainer }]}>Conte sem perder o ritmo.</Text><Text style={[styles.heroText, { color: theme.onPrimaryContainer, opacity: 0.78 }]}>Leia o código do item e conte em unidades ou em lotes de dez. Os registros ficam neste aparelho.</Text></View><View style={[styles.heroIcon, { backgroundColor: `${theme.surface}B8` }]}><Ionicons name="scan-circle-outline" size={36} color={theme.primary} /></View></View>
       <View style={[styles.mainGrid, width < 960 && styles.mainGridMobile]}>
         <View style={[styles.leftColumn, width < 960 && styles.columnMobile]}>
-          <Card>
-            <SectionTitle eyebrow="LEITOR" title="Identificar item" subtitle="Use a câmera para ler QR Code/código de barras ou digite o código." />
-            {scanEnabled ? <CameraScanner onScan={onScan} onClose={() => setScanEnabled(false)} /> : <ActionButton title="Abrir câmera" onPress={() => setScanEnabled(true)} icon="camera-outline" />}
-            <Text style={styles.fieldLabel}>Código do item</Text><TextInput value={scanCode} onChangeText={setScanCode} placeholder="Escaneie ou digite o código" style={styles.textInput} autoCapitalize="none" />
-            {!!scanName && <Text style={styles.scanName}>{scanName}</Text>}
-            <Text style={styles.fieldLabel}>Tamanho da contagem</Text><View style={styles.stepChoices}><Pressable onPress={() => setScanStep(1)} style={[styles.stepChoice, scanStep === 1 && styles.stepChoiceActive]}><Text style={[styles.stepChoiceText, scanStep === 1 && styles.stepChoiceTextActive]}>+1 unidade</Text></Pressable><Pressable onPress={() => setScanStep(10)} style={[styles.stepChoice, scanStep === 10 && styles.stepChoiceActive]}><Text style={[styles.stepChoiceText, scanStep === 10 && styles.stepChoiceTextActive]}>+10 unidades</Text></Pressable></View>
-            <ActionButton title={`Adicionar ${scanStep} à contagem`} onPress={incrementCount} icon="add-circle-outline" disabled={!scanCode.trim() || !!busy} />
+          <Card style={[styles.materialCard, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]}>
+            <SectionTitle eyebrow="LEITOR" title="Identificar item" subtitle="Use a câmera para ler QR Code/código de barras ou digite o código." accent={theme.primary} />
+            {scanEnabled ? <CameraScanner onScan={onScan} onClose={() => setScanEnabled(false)} accent={theme.primary} /> : <ActionButton title="Abrir câmera" onPress={() => setScanEnabled(true)} icon="camera-outline" primaryColor={theme.primary} />}
+            <Text style={styles.fieldLabel}>Código do item</Text><TextInput value={scanCode} onChangeText={setScanCode} placeholder="Escaneie ou digite o código" style={[styles.textInput, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant }]} autoCapitalize="none" />
+            {!!scanName && <Text style={[styles.scanName, { color: theme.primary }]}>{scanName}</Text>}
+            <Text style={styles.fieldLabel}>Tamanho da contagem</Text><View style={styles.stepChoices}><Pressable onPress={() => setScanStep(1)} style={[styles.stepChoice, { backgroundColor: scanStep === 1 ? theme.primaryContainer : theme.surface, borderColor: scanStep === 1 ? theme.primary : theme.surfaceVariant }]}><Text style={[styles.stepChoiceText, { color: scanStep === 1 ? theme.primary : MUTED }]}>+1 unidade</Text></Pressable><Pressable onPress={() => setScanStep(10)} style={[styles.stepChoice, { backgroundColor: scanStep === 10 ? theme.primaryContainer : theme.surface, borderColor: scanStep === 10 ? theme.primary : theme.surfaceVariant }]}><Text style={[styles.stepChoiceText, { color: scanStep === 10 ? theme.primary : MUTED }]}>+10 unidades</Text></Pressable></View>
+            <ActionButton title={`Adicionar ${scanStep} à contagem`} onPress={incrementCount} icon="add-circle-outline" primaryColor={theme.primary} disabled={!scanCode.trim() || !!busy} />
           </Card>
         </View>
         <View style={[styles.rightColumn, width < 960 && styles.columnMobile]}>
-          <Card>
-            <SectionTitle eyebrow="RESULTADO" title={`Itens contados (${counts.length})`} subtitle="A quantidade é acumulada por código." />
-            {counts.length === 0 ? <View style={styles.emptyState}><Ionicons name="calculator-outline" size={30} color="#A7B4AC" /><Text style={styles.emptyTitle}>Nenhum item contado</Text><Text style={styles.helper}>Leia um código e use os botões +1 ou +10.</Text></View> : counts.map(item => <View key={item.code} style={styles.countRow}><View style={{ flex: 1 }}><Text style={styles.countName}>{item.name || 'Item sem descrição'}</Text><Text style={styles.helper}>{item.code}</Text></View><Text style={styles.countValue}>{item.quantity || 0}</Text></View>)}
-            {counts.length > 0 && <View style={styles.rowActions}><ActionButton title="Atualizar" onPress={refreshCounts} secondary small /><ActionButton title="Zerar contagem" onPress={async () => { if (Platform.OS === 'web' ? window.confirm('Apagar todos os registros de contagem?') : true) { await apiCall('/api/counts', { method: 'DELETE' }); await refreshCounts(); } }} secondary small /> </View>}
+          <Card style={[styles.materialCard, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]}>
+            <SectionTitle eyebrow="RESULTADO" title={`Itens contados (${counts.length})`} subtitle="A quantidade é acumulada por código." accent={theme.primary} />
+            {counts.length === 0 ? <View style={styles.emptyState}><Ionicons name="calculator-outline" size={30} color={theme.outline} /><Text style={styles.emptyTitle}>Nenhum item contado</Text><Text style={styles.helper}>Leia um código e use os botões +1 ou +10.</Text></View> : counts.map(item => <View key={item.code} style={[styles.countRow, { borderColor: theme.surfaceVariant }]}><View style={{ flex: 1 }}><Text style={styles.countName}>{item.name || 'Item sem descrição'}</Text><Text style={styles.helper}>{item.code}</Text></View><Text style={[styles.countValue, { color: theme.primary }]}>{item.quantity || 0}</Text></View>)}
+            {counts.length > 0 && <View style={styles.rowActions}><ActionButton title="Atualizar" onPress={refreshCounts} secondary small primaryColor={theme.primary} /><ActionButton title="Zerar contagem" onPress={async () => { const confirmed = Platform.OS === 'web' ? window.confirm('Apagar todos os registros de contagem?') : true; if (confirmed) { await persistPatch({ counts: [] }); setCounts([]); } }} secondary small primaryColor={theme.primary} /> </View>}
           </Card>
-          <Card style={styles.noteCard}><Ionicons name="information-circle-outline" size={20} color={GREEN} /><Text style={styles.noteText}>Módulo experimental: a leitura identifica o produto; a contagem só é somada quando você toca em “Adicionar”. Assim você pode contar 10 unidades fisicamente e registrar de uma vez com +10.</Text></Card>
+          <Card style={[styles.materialCard, { backgroundColor: theme.primaryContainer, borderColor: theme.surfaceVariant, flexDirection: 'row', alignItems: 'flex-start' }]}><Ionicons name="information-circle-outline" size={20} color={theme.primary} /><Text style={[styles.noteText, { color: theme.onPrimaryContainer }]}>A leitura identifica o produto; a contagem só é somada quando você toca em “Adicionar”. Assim você pode contar 10 unidades fisicamente e registrar de uma vez com +10.</Text></Card>
         </View>
       </View>
     </ScrollView>}
 
-    {!!busy && <View style={styles.busyOverlay}><View style={styles.busyCard}><ActivityIndicator color={GREEN} size="small" /><Text style={styles.busyText}>{busy}</Text></View></View>}
+    {!!busy && <View style={styles.busyOverlay}><View style={styles.busyCard}><ActivityIndicator color={theme.primary} size="small" /><Text style={styles.busyText}>{busy}</Text></View></View>}
   </View>;
 }
 
@@ -629,9 +789,12 @@ const styles = StyleSheet.create({
   topBar: { minHeight: 70, paddingHorizontal: 22, paddingVertical: 12, flexDirection: 'row', alignItems: 'center', borderBottomWidth: 1, borderBottomColor: LINE, backgroundColor: '#FFFFFF', gap: 12 },
   brandMark: { width: 40, height: 40, borderRadius: 13, backgroundColor: GREEN, alignItems: 'center', justifyContent: 'center' },
   brandTitle: { color: INK, fontSize: 17, fontWeight: '900', letterSpacing: 1.1 }, brandMuted: { fontWeight: '500', color: MUTED, letterSpacing: 0 }, brandSubtitle: { color: MUTED, fontSize: 9, letterSpacing: 1.6, marginTop: 2, fontWeight: '700' },
+  offlineTag: { flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: '#EAF4EE', borderRadius: 8, paddingHorizontal: 8, paddingVertical: 6 }, offlineTagText: { color: GREEN, fontSize: 9, fontWeight: '900', letterSpacing: 0.7 },
   iconButton: { padding: 9, borderRadius: 10, backgroundColor: '#F2F6F3' }, connectionDot: { width: 8, height: 8, borderRadius: 9 }, dotOn: { backgroundColor: '#24A36B' }, dotOff: { backgroundColor: '#D59A52' },
   settingsPanel: { padding: 15, backgroundColor: '#FFFFFF', borderBottomWidth: 1, borderBottomColor: LINE, gap: 9 }, settingsTitle: { color: INK, fontSize: 13, fontWeight: '800' },
-  tabBar: { flexDirection: 'row', backgroundColor: '#FFFFFF', paddingHorizontal: 22, borderBottomWidth: 1, borderBottomColor: LINE, gap: 22 }, tab: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 14, borderBottomWidth: 2, borderBottomColor: 'transparent' }, tabActive: { borderBottomColor: GREEN }, tabText: { color: MUTED, fontSize: 13, fontWeight: '700' }, tabTextActive: { color: GREEN }, betaTag: { color: '#A36B20', backgroundColor: '#FFF3D8', fontSize: 8, fontWeight: '900', paddingHorizontal: 5, paddingVertical: 2, borderRadius: 5 },
+  tabBar: { flexDirection: 'row', backgroundColor: '#FFFFFF', paddingHorizontal: 18, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: LINE, gap: 8 }, tab: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, paddingVertical: 11, borderRadius: 16, borderBottomWidth: 0 }, tabActive: { borderBottomColor: GREEN }, tabText: { color: MUTED, fontSize: 13, fontWeight: '700' }, tabTextActive: { color: GREEN }, betaTag: { color: '#A36B20', backgroundColor: '#FFF3D8', fontSize: 8, fontWeight: '900', paddingHorizontal: 5, paddingVertical: 2, borderRadius: 5 },
+  themeOpenButton: { width: 42, height: 42, borderRadius: 15, borderWidth: 1, alignItems: 'center', justifyContent: 'center' }, themePickerPanel: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 18, paddingVertical: 13, borderBottomWidth: 1, gap: 12 }, themeSwatches: { flexDirection: 'row', gap: 9, alignItems: 'center' }, themeSwatch: { width: 30, height: 30, borderRadius: 15, borderWidth: 2, alignItems: 'center', justifyContent: 'center' },
+  workflowTabs: { flexDirection: 'row', padding: 5, borderRadius: 19, borderWidth: 1, gap: 4 }, workflowStep: { flex: 1, minWidth: 0, minHeight: 46, borderWidth: 1, borderRadius: 15, alignItems: 'center', justifyContent: 'center', flexDirection: 'row', gap: 7 }, workflowNumber: { width: 25, height: 25, borderRadius: 13, alignItems: 'center', justifyContent: 'center' }, workflowStepText: { fontSize: 12, fontWeight: '800' }, materialCard: { borderRadius: 24, padding: 18, borderWidth: 1, shadowColor: '#172033', shadowOpacity: 0.05, shadowRadius: 14, shadowOffset: { width: 0, height: 5 }, elevation: 2, gap: 16 }, materialFileRow: { flexDirection: 'row', alignItems: 'center', gap: 12, padding: 13, borderRadius: 18, borderWidth: 1 }, materialIconCircle: { width: 48, height: 48, borderRadius: 17, alignItems: 'center', justifyContent: 'center' }, inlineSuccess: { borderRadius: 14, padding: 12, flexDirection: 'row', alignItems: 'center', gap: 8 }, inlineSuccessText: { flex: 1, fontSize: 11, fontWeight: '700', lineHeight: 16 }, stepFooter: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap', paddingTop: 6 }, listSummary: { padding: 14, borderRadius: 16, gap: 4 }, listSummaryTitle: { fontSize: 15, fontWeight: '900' }, previewHeader: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingTop: 4 }, previewLiveTag: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 10, paddingVertical: 7, borderRadius: 20 }, previewLiveDot: { width: 7, height: 7, borderRadius: 4 }, previewLiveText: { fontSize: 9, fontWeight: '900', letterSpacing: 0.8 }, previewFallback: { minHeight: 120, borderRadius: 16, backgroundColor: '#F4F5F8', alignItems: 'center', justifyContent: 'center', gap: 8, padding: 18 }, adjustPanel: { borderRadius: 20, padding: 15, borderWidth: 1, gap: 13 }, adjustTitle: { fontSize: 16, fontWeight: '900' }, adjustSegmentRow: { flexDirection: 'row', gap: 8 }, adjustSegment: { minHeight: 42, flex: 1, borderWidth: 1, borderRadius: 14, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 10 }, slotPickerRow: { flexDirection: 'row', alignItems: 'center', gap: 12, justifyContent: 'space-between' }, adjustStepRow: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 7 }, adjustStepChip: { borderWidth: 1, borderRadius: 18, paddingHorizontal: 10, paddingVertical: 7 }, dpadWrap: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 20, flexWrap: 'wrap' }, dpadColumn: { alignItems: 'center', gap: 6 }, dpadMiddle: { flexDirection: 'row', alignItems: 'center', gap: 6 }, dpadButton: { width: 46, height: 42, borderRadius: 14, borderWidth: 1, alignItems: 'center', justifyContent: 'center' }, dpadCenter: { width: 42, height: 42, borderRadius: 14, alignItems: 'center', justifyContent: 'center' }, offsetReadout: { minWidth: 120, flex: 1, backgroundColor: 'rgba(255,255,255,0.68)', padding: 13, borderRadius: 15, gap: 4 }, offsetValue: { fontSize: 15, fontWeight: '900', fontVariant: ['tabular-nums'] },
   apiWarning: { marginHorizontal: 22, marginTop: 12, backgroundColor: '#FFF7E9', borderColor: '#F2DEC0', borderWidth: 1, borderRadius: 12, padding: 12, flexDirection: 'row', alignItems: 'center', gap: 9 }, apiWarningTitle: { color: '#875018', fontSize: 12, fontWeight: '800' }, apiWarningText: { color: '#956F43', fontSize: 11, marginTop: 2 },
   content: { width: '100%', maxWidth: 1200, alignSelf: 'center', padding: 22, paddingBottom: 48, gap: 18 }, heroRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 5, gap: 14 }, heroEyebrow: { color: GREEN, fontWeight: '900', fontSize: 10, letterSpacing: 1.7, marginBottom: 6 }, heroTitle: { color: INK, fontSize: 28, fontWeight: '900', letterSpacing: -0.7 }, heroText: { color: MUTED, fontSize: 13, lineHeight: 19, marginTop: 5, maxWidth: 620 }, heroIcon: { width: 66, height: 66, borderRadius: 20, backgroundColor: '#E7F2EB', alignItems: 'center', justifyContent: 'center' },
   statRow: { flexDirection: 'row', gap: 11, flexWrap: 'wrap' }, statCard: { flex: 1, minWidth: 0, backgroundColor: '#FFFFFF', borderRadius: 14, padding: 14, borderColor: LINE, borderWidth: 1 }, statLabel: { fontSize: 9, color: MUTED, fontWeight: '900', letterSpacing: 1 }, statValue: { fontSize: 23, color: INK, fontWeight: '900', marginTop: 5 }, statFoot: { fontSize: 10, color: MUTED, marginTop: 2 },

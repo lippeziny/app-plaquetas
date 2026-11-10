@@ -6,9 +6,4 @@ ios/
 *.log
 .env
 .env.local
-server/data/*
-!server/data/.gitkeep
-server/uploads/*
-!server/uploads/.gitkeep
-server/outputs/*
-!server/outputs/.gitkeep
+.test-tmp/

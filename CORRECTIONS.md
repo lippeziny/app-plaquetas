@@ -1,37 +1,34 @@
-# Correções desta revisão
+# Revisão offline e interface Material You
 
-## Inicialização do aplicativo
+## Funcionamento offline
 
-- Corrigido um erro de inicialização encontrado na revisão do código: `useWindowDimensions` estava sendo importado de `react`, mas é exportado por `react-native`. A tela principal chamava esse hook ao montar, o que podia impedir o app de abrir.
-- O Android físico não usa mais `10.0.2.2` como endereço padrão (esse host é específico do emulador).
-- O endereço inicial do backend agora é o HTTPS que já está declarado no `render.yaml`: `https://plaquetas-by-lippe.onrender.com`.
-- A configuração manual do servidor valida o formato da URL e a interface informa quando a API está indisponível.
-- A verificação inicial do backend foi simplificada e a câmera só pede permissões quando o usuário abre o leitor.
-- Foi incluído um limite de recuperação para erros de renderização do React; isso não captura falhas nativas fatais do Android.
-- O projeto foi configurado para a arquitetura antiga do React Native no SDK 54 como tentativa de compatibilidade para o APK que não iniciava. Essa alteração exige uma nova compilação nativa.
-- O app não solicita permissão de microfone porque só usa a câmera para ler códigos.
+- Removida a dependência da API/Render na aplicação mobile. Importação de planilhas, pesquisa, lista de plaquetas, contagem, leitura de códigos, armazenamento e exportações são executados no aparelho.
+- Modelo PowerPoint padrão incluído no pacote do app; modelos selecionados são copiados para o armazenamento privado.
+- Permissões Android de internet e estado da rede bloqueadas no `app.json`.
+- Dados locais guardam base importada, registros de contagem, modelo atual, tema e ajustes de posição.
 
-## GitHub Actions
+## Prévia e posição
 
-- Corrigida a incompatibilidade vista nos logs de 10/11/2026: `@react-native-picker/picker` foi fixado em `2.11.1`, a versão indicada pelo Expo SDK 54; antes, o npm instalava `2.11.4` por causa do intervalo `^2.11.1`, e `expo install --check` parava os builds Android e iOS.
-- Adicionada verificação de tipos TypeScript aos jobs Android, simulador iOS e IPA.
-- Atualizadas as ações oficiais do GitHub para versões compatíveis com o runtime Node.js 24 dos runners atuais.
-- Removido o cache npm que falhava sem `package-lock.json`. Os builds usam `npm install` até o lockfile ser adicionado.
-- Expo Prebuild agora roda com `CI=1` e `--clean`, em vez da opção obsoleta `--non-interactive`.
-- Android usa JDK 17 e compila APK release após limpar o Gradle.
-- iOS descobre o workspace e o scheme reais em vez de presumir o nome do workspace.
-- O artefato do simulador iOS é empacotado em ZIP para facilitar o download; ele não é instalável em iPhone físico.
-- Mantido job opcional para IPA assinado via Apple Developer / TestFlight.
+- O inspetor PPTX agora também extrai geometria, texto, cor, alinhamento, contorno e imagens dos objetos comuns do slide para montar a prévia.
+- A tela mostra o slide completo e atualiza os campos à medida que o usuário altera os deslocamentos.
+- Adicionado ajuste global e por posição individual (posição física na folha), separado para código e nome.
+- Os deslocamentos em milímetros são salvos no armazenamento local e aplicados ao XML do PowerPoint na exportação.
+- Mapeamento manual de IDs também é refletido na prévia e os IDs inválidos, duplicados ou sobrepostos são validados.
+- O PDF usa grade simplificada e os mesmos deslocamentos; o PPTX é o formato que preserva o modelo original.
 
-## Validação e limitações
+## Interface
 
-- O JSON do Expo e o YAML do workflow foram validados por parser.
-- O arquivo TSX foi analisado pelo parser do TypeScript sem erros de sintaxe.
-- Não foi possível executar `npm install`, `npm test`, Gradle ou Xcode nesta sessão porque o acesso ao registry npm falhou por `EAI_AGAIN`; portanto, esta revisão não é apresentada como build nativo concluído. O workflow continuará usando `npm install` e gerará o lockfile de trabalho no runner; nenhum `package-lock.json` falso foi criado.
-- Os logs mais recentes mostram que Android e simulador iOS pararam em `expo install --check` por causa do Picker fora da versão recomendada. Não mostram uma compilação nativa concluída nem incluem `logcat`; portanto, ainda não existe evidência de teste do APK corrigido em aparelho físico.
-- O job `ios-ipa` não aparece nessa execução; somente o simulador foi acionado. Para IPA é preciso definir `BUILD_IOS_IPA=true` e cadastrar os Secrets/Variables Apple descritos no README.
+- Fluxo de criação dividido em três passos: Base, Itens e Modelo.
+- Paletas claras azul, verde, roxo, âmbar e turquesa inspiradas no Material You.
+- Componentes com superfícies arredondadas, estados selecionados e controles de posição por setas.
+- Tema aplicado também ao módulo de contagem.
 
+## Compilação e validação
 
-## Correção v3 — TypeScript `TemplateSlide.orientation`
+- Java 17 para o build Android.
+- Dependências do Expo verificadas antes de compilar.
+- Picker fixado em `2.11.1` para o SDK 54.
+- `npm install` usado nos workflows até o `package-lock.json` ser adicionado ao repositório.
+- O job de simulador iOS não gera IPA instalável em iPhone real; para isso é preciso assinar com certificado/perfil Apple.
 
-O backend (`server/lib/pptx.cjs`) já devolve `orientation` como `portrait` ou `landscape` na inspeção do modelo PowerPoint. O tipo `TemplateSlide` do aplicativo não declarava essa propriedade, causando o erro TS2339 no passo `npm run typecheck`. A propriedade foi adicionada ao tipo com a união literal correspondente.
+Nesta revisão, a instalação de dependências do npm não respondeu dentro do tempo disponível nesta sessão. Portanto, não foi possível executar `npm run typecheck`, `npm test`, Gradle ou Xcode localmente. Os testes automatizados incluídos no repositório serão executados pelo GitHub Actions na próxima compilação.
