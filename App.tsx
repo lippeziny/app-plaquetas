@@ -23,7 +23,9 @@ import * as Print from 'expo-print';
 import { applyTemplateFieldMapping, buildPptx, type SlidePositionSettings, type TemplateVisual } from './offline/pptx';
 import TemplatePreview from './offline/TemplatePreview';
 import { buildLabelsPdfHtml } from './offline/pdf';
-import { importWorkbookSheet, normalizeSearch, parseWorkbookBytes, previewWorkbookSheet, type ParsedWorkbook } from './offline/workbook';
+import { normalizeSearch } from './offline/text';
+import { cleanupWorkbookFile, importXlsxSheetToCatalog, inspectXlsxFile, previewXlsxSheet, type WorkbookFileSource, type ImportProgress } from './offline/streaming-xlsx';
+import { findCatalogByCode, findCatalogItems, getCatalogCount, initializeCatalogStore, replaceCatalogFromItems, searchCatalogNames } from './offline/catalog-db';
 import { EMPTY_LOCAL_DATA, readLocalData, writeLocalData, type StoredAppData } from './offline/storage';
 import { Ionicons } from '@expo/vector-icons';
 
@@ -69,6 +71,30 @@ function showMessage(message: string) {
   } else Alert.alert('Plaquetas', message);
 }
 function makeId() { return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; }
+function formatElapsed(seconds: number) {
+  const safe = Math.max(0, Math.floor(seconds || 0));
+  if (safe < 60) return `${safe} s`;
+  const minutes = Math.floor(safe / 60);
+  const remaining = safe % 60;
+  return remaining ? `${minutes} min ${remaining} s` : `${minutes} min`;
+}
+function formatEta(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return 'quase pronto';
+  if (seconds < 60) return `${Math.ceil(seconds)} s`;
+  const minutes = Math.floor(seconds / 60);
+  const remaining = Math.ceil(seconds % 60);
+  return remaining ? `${minutes} min ${remaining} s` : `${minutes} min`;
+}
+function estimateRemainingSeconds(percent: number, elapsedMs: number, recentSpeed: number) {
+  if (elapsedMs < 1800 || percent < 0.08 || percent >= 1) return undefined;
+  const remaining = 1 - percent;
+  const averageEta = (elapsedMs / 1000) * (remaining / Math.max(percent, 0.02));
+  if (recentSpeed <= 0.0005) return Math.max(0, Math.round(averageEta));
+  const recentEta = remaining / recentSpeed;
+  // Blend recent speed with the whole-run average so long database stages are
+  // reflected in the estimate instead of leaving a stale ETA on screen.
+  return Math.max(0, Math.round(recentEta * 0.65 + averageEta * 0.35));
+}
 function splitValues(text: string) { return text.split(/[\n,;\t]+/).map(v => v.trim()).filter(Boolean); }
 function parseShapeIds(value: string) { return value.split(/[\s,;]+/).map(v => v.trim()).filter(Boolean); }
 function bytesToBase64(bytes: Uint8Array): string {
@@ -197,11 +223,35 @@ function AppScreen() {
   const [sheetNames, setSheetNames] = useState<string[]>([]);
   const [sheetName, setSheetName] = useState('');
   const [workbookPreview, setWorkbookPreview] = useState<WorkbookPreview | null>(null);
-  const [workbookData, setWorkbookData] = useState<ParsedWorkbook | null>(null);
+  const [workbookData, setWorkbookData] = useState<WorkbookFileSource | null>(null);
+  const [catalogCount, setCatalogCount] = useState(0);
+  const [importProgress, setImportProgress] = useState<(ImportProgress & { etaSeconds?: number; elapsedSeconds?: number; rowsPerSecond?: number }) | null>(null);
+  const importControllerRef = useRef<AbortController | null>(null);
+  const importStartedAtRef = useRef(0);
+  const importProgressSampleRef = useRef<{ at: number; percent: number; speed: number } | null>(null);
+
+  // Keep the elapsed clock and ETA moving even while a large SQLite operation is busy.
+  useEffect(() => {
+    if (!importProgress) return;
+    const timer = setInterval(() => {
+      const now = Date.now();
+      const elapsedMs = importStartedAtRef.current ? now - importStartedAtRef.current : 0;
+      const speed = importProgressSampleRef.current?.speed || 0;
+      setImportProgress(current => {
+        if (!current) return null;
+        const etaSeconds = estimateRemainingSeconds(current.percent, elapsedMs, speed) ?? current.etaSeconds;
+        const rowsPerSecond = current.rowsProcessed !== undefined && elapsedMs >= 1000
+          ? Math.round(current.rowsProcessed / (elapsedMs / 1000))
+          : current.rowsPerSecond;
+        return { ...current, elapsedSeconds: Math.floor(elapsedMs / 1000), etaSeconds, rowsPerSecond };
+      });
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [!!importProgress]);
+
   const [codeColumn, setCodeColumn] = useState(1);
   const [nameColumn, setNameColumn] = useState(2);
-  const [quantityColumn, setQuantityColumn] = useState(6);
-  const [catalog, setCatalog] = useState<CatalogItem[]>([]);
+  const [quantityColumn, setQuantityColumn] = useState(4);
   const [template, setTemplate] = useState<TemplateInfo | null>(null);
   const [templateBase64, setTemplateBase64] = useState('');
   const [templateSlide, setTemplateSlide] = useState(0);
@@ -278,6 +328,13 @@ function AppScreen() {
     (async () => {
       try {
         const saved = await readLocalData();
+        await initializeCatalogStore();
+        const existingCatalogCount = await getCatalogCount();
+        if (existingCatalogCount === 0 && Array.isArray(saved.catalog) && saved.catalog.length) {
+          await replaceCatalogFromItems(saved.catalog);
+          await writeLocalData({ ...saved, catalog: [] });
+        }
+        const currentCatalogCount = await getCatalogCount();
         let base64 = saved.templateBase64 || '';
         if (!base64 && saved.templateUri) {
           try { base64 = await FileSystem.readAsStringAsync(saved.templateUri, { encoding: FileSystem.EncodingType.Base64 }); }
@@ -286,9 +343,10 @@ function AppScreen() {
         if (!base64) base64 = await readTemplateAssetBase64();
         const info = await (await import('./offline/pptx')).inspectPptx(base64, saved.templateName || 'PLAQUETAS_BY_FILLIPE.PPTX');
         if (!alive) return;
-        localDataRef.current = saved;
-        setCatalog(saved.catalog);
-        setDatabase(saved.database);
+        const cleanSaved = { ...saved, catalog: [] };
+        localDataRef.current = cleanSaved;
+        setCatalogCount(currentCatalogCount);
+        setDatabase({ ...saved.database, total: currentCatalogCount || saved.database.total, ready: currentCatalogCount > 0 || saved.database.ready });
         setTemplateAdjustments(saved.templateAdjustments || {});
         setThemeId(APP_THEMES.some(theme => theme.id === saved.themeId) ? (saved.themeId as string) : 'azul');
         setDatabaseFile(saved.database.sourceFile || '');
@@ -310,8 +368,10 @@ function AppScreen() {
     if (inputMode !== 'name' || inputText.trim().length < 2 || !localReady) { setSuggestions([]); return; }
     const query = normalizeSearch(inputText.split(/[\n,;]+/).pop() || '');
     if (!query) { setSuggestions([]); return; }
-    setSuggestions(catalog.filter(item => normalizeSearch(item.name).includes(query)).slice(0, 8));
-  }, [inputText, inputMode, catalog, localReady]);
+    let active = true;
+    searchCatalogNames(query, 8).then(rows => { if (active) setSuggestions(rows); }).catch(() => { if (active) setSuggestions([]); });
+    return () => { active = false; };
+  }, [inputText, inputMode, localReady]);
 
   const refreshCounts = useCallback(async () => {
     const stored = await readLocalData();
@@ -319,60 +379,110 @@ function AppScreen() {
     setCounts(stored.counts || []);
   }, []);
 
+  const updateImportProgress = useCallback((progress: ImportProgress) => {
+    const now = Date.now();
+    const elapsedMs = importStartedAtRef.current ? now - importStartedAtRef.current : 0;
+    const previous = importProgressSampleRef.current;
+    let speed = previous?.speed || 0;
+    if (previous && now - previous.at >= 500 && progress.percent > previous.percent + 0.002) {
+      const instantSpeed = (progress.percent - previous.percent) / ((now - previous.at) / 1000);
+      speed = speed > 0 ? speed * 0.65 + instantSpeed * 0.35 : instantSpeed;
+      importProgressSampleRef.current = { at: now, percent: progress.percent, speed };
+    } else if (!previous) {
+      importProgressSampleRef.current = { at: now, percent: progress.percent, speed: 0 };
+    }
+    const etaSeconds = estimateRemainingSeconds(progress.percent, elapsedMs, speed);
+    const elapsedSeconds = Math.max(0, Math.floor(elapsedMs / 1000));
+    const rowsPerSecond = progress.rowsProcessed !== undefined && elapsedMs >= 1000
+      ? Math.round(progress.rowsProcessed / (elapsedMs / 1000))
+      : undefined;
+    setImportProgress({ ...progress, etaSeconds, elapsedSeconds, rowsPerSecond });
+  }, []);
+
+  const startImportProgress = () => {
+    const now = Date.now();
+    importStartedAtRef.current = now;
+    importProgressSampleRef.current = { at: now, percent: 0.01, speed: 0 };
+    setImportProgress({ stage: 'Preparando importação segura', percent: 0.01 });
+  };
+
   const loadSheetPreview = useCallback(async (name: string) => {
     if (!workbookData || !name) return;
+    const controller = new AbortController();
+    importControllerRef.current = controller;
     try {
-      const preview = previewWorkbookSheet(workbookData, name, 5);
+      startImportProgress();
+      const preview = await previewXlsxSheet(workbookData, name, updateImportProgress, controller.signal);
       setWorkbookPreview(preview);
       setCodeColumn(preview.suggested.codeColumn || 1);
       setNameColumn(preview.suggested.nameColumn || 2);
-      setQuantityColumn(preview.suggested.quantityColumn || 0);
-    } catch (error: any) { showMessage(error.message); }
-  }, [workbookData]);
+      setQuantityColumn(preview.suggested.quantityColumn || 4);
+    } catch (error: any) { if (error?.message !== 'IMPORT_CANCELLED' && error?.code !== 'ERR_CANCELLED') showMessage(error.message); }
+    finally { importControllerRef.current = null; setImportProgress(null); }
+  }, [workbookData, updateImportProgress]);
 
   const onChooseDatabase = async () => {
     try {
       const asset = await chooseFile('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       if (!asset) return;
-      const fileSize = Number(asset.size || 0);
-      const maxImportBytes = 50 * 1024 * 1024;
-      if (fileSize > maxImportBytes) {
-        return showMessage(`Esta planilha tem ${(fileSize / 1024 / 1024).toFixed(1)} MB. Para evitar falta de memória no celular, reduza o arquivo para até 50 MB: mantenha apenas as abas necessárias e remova imagens/objetos incorporados. Depois tente novamente.`);
-      }
-      setBusy('Lendo planilha no aparelho...');
-      const bytes = await readPickedFileBytes(asset);
-      const parsed = parseWorkbookBytes(bytes);
-      setWorkbookData(parsed);
-      setDatabaseFile(asset.name || 'planilha.xlsx');
-      setSheetNames(parsed.sheetNames);
-      const first = parsed.sheetNames[0] || '';
+      await cleanupWorkbookFile(workbookData);
+      setWorkbookData(null);
+      setWorkbookPreview(null);
+      const controller = new AbortController();
+      importControllerRef.current = controller;
+      startImportProgress();
+      const source = await inspectXlsxFile(asset.uri, asset.name || 'estoque.xlsx', updateImportProgress, controller.signal);
+      setWorkbookData(source);
+      setDatabaseFile(asset.name || 'estoque.xlsx');
+      setSheetNames(source.sheetNames);
+      const first = source.sheetNames[0] || '';
       setSheetName(first);
-      const preview = previewWorkbookSheet(parsed, first, 5);
+      const preview = await previewXlsxSheet(source, first, updateImportProgress, controller.signal);
       setWorkbookPreview(preview);
       setCodeColumn(preview.suggested.codeColumn || 1);
       setNameColumn(preview.suggested.nameColumn || 2);
-      setQuantityColumn(preview.suggested.quantityColumn || 0);
-    } catch (error: any) { showMessage(error.message || 'Não foi possível ler essa planilha.'); }
-    finally { setBusy(''); }
+      setQuantityColumn(preview.suggested.quantityColumn || 4);
+    } catch (error: any) {
+      if (error?.message !== 'IMPORT_CANCELLED' && error?.code !== 'ERR_CANCELLED') showMessage(error.message || 'Não foi possível ler essa planilha.');
+    } finally {
+      importControllerRef.current = null;
+      setImportProgress(null);
+    }
   };
 
   const onImportDatabase = async () => {
     if (!workbookData || !sheetName) return showMessage('Selecione uma planilha e uma aba primeiro.');
     if (!codeColumn || !nameColumn) return showMessage('Selecione as colunas de código e nome antes de importar.');
-    setBusy('Salvando a base no aparelho...');
+    const controller = new AbortController();
+    importControllerRef.current = controller;
+    startImportProgress();
     try {
-      const result = importWorkbookSheet(workbookData, sheetName, { codeColumn, nameColumn, quantityColumn }, databaseFile || 'planilha.xlsx');
-      const meta = { total: result.items.length, ready: result.items.length > 0, sheetName, sourceFile: databaseFile || 'planilha.xlsx' };
-      await persistPatch({ catalog: result.items, database: meta });
-      setCatalog(result.items);
+      const result = await importXlsxSheetToCatalog(
+        workbookData, sheetName, { codeColumn, nameColumn, quantityColumn }, updateImportProgress, controller.signal,
+      );
+      const meta = { total: result.total, ready: result.total > 0, sheetName, sourceFile: databaseFile || 'planilha.xlsx' };
+      await persistPatch({ catalog: [], database: meta });
+      setCatalogCount(result.total);
       setDatabase(meta);
+      await cleanupWorkbookFile(workbookData);
       setWorkbookData(null);
       setSheetNames([]);
       setWorkbookPreview(null);
       setWorkflowStep('items');
-      showMessage(`${result.items.length.toLocaleString('pt-BR')} itens importados da aba ${sheetName} e salvos neste aparelho.${result.skipped ? ` ${result.skipped} linha(s) sem código ou nome foram ignoradas.` : ''}`);
-    } catch (error: any) { showMessage(error.message); }
-    finally { setBusy(''); }
+      setImportProgress(null);
+      showMessage(`${result.total.toLocaleString('pt-BR')} produtos importados e salvos neste aparelho.${result.skipped ? ` ${result.skipped.toLocaleString('pt-BR')} linha(s) sem código ou descrição foram ignoradas.` : ''}`);
+    } catch (error: any) {
+      if (error?.message === 'IMPORT_CANCELLED') showMessage('Importação cancelada. A base anterior foi mantida.');
+      else showMessage(error.message || 'Não foi possível concluir a importação. A base anterior foi preservada.');
+    } finally {
+      importControllerRef.current = null;
+      setImportProgress(null);
+    }
+  };
+
+  const cancelImport = () => {
+    importControllerRef.current?.abort();
+    setImportProgress(progress => progress ? { ...progress, stage: 'Cancelando com segurança...' } : null);
   };
 
   const onChooseTemplate = async () => {
@@ -402,12 +512,10 @@ function AppScreen() {
     if (values.length > 1000) return showMessage('Adicione até 1.000 itens por vez.');
     setBusy('Conferindo itens na base local...');
     try {
+      const matches = await findCatalogItems(values, inputMode);
       const entries = values.map(input => {
         const key = normalizeSearch(input);
-        const item = inputMode === 'name'
-          ? catalog.find(row => normalizeSearch(row.name) === key)
-          : catalog.find(row => normalizeSearch(row.code) === key);
-        return { input, item: item || null };
+        return { input, item: matches.get(key) || null };
       });
       const mapped: LabelItem[] = entries.map(entry => ({
         localId: makeId(),
@@ -501,8 +609,7 @@ function AppScreen() {
     if (!data || (lastScan.current.code === data && now - lastScan.current.at < 1800)) return;
     lastScan.current = { code: data, at: now };
     setScanCode(data);
-    const key = normalizeSearch(data);
-    const found = catalog.find(item => normalizeSearch(item.code) === key) || catalog.find(item => normalizeSearch(item.code).includes(key));
+    const found = await findCatalogByCode(data);
     setScanName(found?.name || 'Item não encontrado na base local');
   };
 
@@ -513,7 +620,7 @@ function AppScreen() {
       setBusy('Salvando contagem local...');
       const key = normalizeSearch(code);
       const existing = counts.find(item => normalizeSearch(item.code) === key);
-      const found = catalog.find(item => normalizeSearch(item.code) === key);
+      const found = await findCatalogByCode(code);
       const current = Number(String(existing?.quantity || '0').replace(',', '.')) || 0;
       const nextItem: CatalogItem = {
         code,
@@ -571,7 +678,7 @@ function AppScreen() {
       </View>
 
       <View style={styles.statRow}>
-        <View style={[styles.statCard, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]}><Text style={styles.statLabel}>NA BASE</Text><Text style={[styles.statValue, { color: theme.primary }]}>{database.total.toLocaleString('pt-BR')}</Text><Text style={styles.statFoot}>{database.ready ? 'Materiais salvos' : 'Importe o Excel'}</Text></View>
+        <View style={[styles.statCard, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]}><Text style={styles.statLabel}>NA BASE</Text><Text style={[styles.statValue, { color: theme.primary }]}>{catalogCount.toLocaleString('pt-BR')}</Text><Text style={styles.statFoot}>{database.ready ? 'Materiais salvos' : 'Importe o Excel'}</Text></View>
         <View style={[styles.statCard, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]}><Text style={styles.statLabel}>NA LISTA</Text><Text style={[styles.statValue, { color: theme.primary }]}>{labels.length}</Text><Text style={styles.statFoot}>Plaquetas preparadas</Text></View>
         <View style={[styles.statCard, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]}><Text style={styles.statLabel}>FOLHAS</Text><Text style={[styles.statValue, { color: theme.primary }]}>{labels.length ? requiredPages : '—'}</Text><Text style={styles.statFoot}>{capacity} por folha</Text></View>
       </View>
@@ -597,7 +704,7 @@ function AppScreen() {
           <View style={[styles.materialIconCircle, { backgroundColor: theme.primaryContainer }]}><Ionicons name="document-text-outline" size={24} color={theme.primary} /></View>
           <View style={{ flex: 1, gap: 3 }}>
             <Text style={styles.uploadTitle}>{databaseFile || database.sourceFile || 'Nenhuma planilha selecionada'}</Text>
-            <Text style={styles.helper}>{database.ready ? `${database.total.toLocaleString('pt-BR')} registros · ${database.sheetName}` : 'Planilha Excel .xlsx com uma ou mais abas'}</Text>
+            <Text style={styles.helper}>{database.ready ? `${catalogCount.toLocaleString('pt-BR')} registros · ${database.sheetName}` : 'Planilha Excel .xlsx com uma ou mais abas'}</Text>
           </View>
         </View>
         <ActionButton title={database.ready ? 'Trocar planilha Excel' : 'Selecionar planilha Excel'} onPress={onChooseDatabase} icon="folder-open-outline" primaryColor={theme.primary} disabled={!!busy} />
@@ -605,7 +712,7 @@ function AppScreen() {
           <Text style={styles.fieldLabel}>1. Escolha a aba da planilha</Text>
           <View style={[styles.pickerWrap, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant }]}><Picker selectedValue={sheetName} onValueChange={(value) => { setSheetName(value); loadSheetPreview(value); }} style={styles.picker}><Picker.Item label="Selecione a aba" value="" />{sheetNames.map(name => <Picker.Item key={name} label={name} value={name} />)}</Picker></View>
           {workbookPreview && <>
-            <Text style={styles.fieldLabel}>2. Confira as colunas</Text>
+            <Text style={styles.fieldLabel}>2. Confira as colunas</Text><Text style={styles.helper}>Padrão do estoque: A = código, B = nome e D = quantidade. Você pode alterar o mapeamento abaixo.</Text>
             <View style={[styles.mappingRow, width < 550 && styles.mappingRowMobile]}>
               <View style={styles.mappingField}><Text style={styles.miniLabel}>CÓDIGO</Text><View style={[styles.pickerWrap, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant }]}><Picker selectedValue={codeColumn} onValueChange={setCodeColumn} style={styles.picker}>{workbookPreview.columns.map(c => <Picker.Item key={c.index} label={`${c.index}. ${c.label}`} value={c.index} />)}</Picker></View></View>
               <View style={styles.mappingField}><Text style={styles.miniLabel}>NOME / DESCRIÇÃO</Text><View style={[styles.pickerWrap, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant }]}><Picker selectedValue={nameColumn} onValueChange={setNameColumn} style={styles.picker}>{workbookPreview.columns.map(c => <Picker.Item key={c.index} label={`${c.index}. ${c.label}`} value={c.index} />)}</Picker></View></View>
@@ -623,7 +730,7 @@ function AppScreen() {
         </View>}
         {database.ready && <View style={[styles.inlineSuccess, { backgroundColor: theme.primaryContainer }]}><Ionicons name="checkmark-circle" size={18} color={theme.primary} /><Text style={[styles.inlineSuccessText, { color: theme.onPrimaryContainer }]}>Base salva localmente e disponível mesmo sem internet.</Text></View>}
         <View style={styles.stepFooter}>
-          <View style={{ flex: 1 }}><Text style={styles.helper}>Você pode continuar sem importar uma planilha e digitar os itens manualmente.</Text></View>
+          <View style={{ flex: 1 }}><Text style={styles.helper}>O importador lê somente as colunas escolhidas e salva os produtos em um banco local otimizado. Você também pode continuar digitando os itens manualmente.</Text></View>
           <ActionButton title="Continuar" onPress={() => setWorkflowStep('items')} icon="arrow-forward" primaryColor={theme.primary} />
         </View>
       </Card>}
@@ -758,6 +865,7 @@ function AppScreen() {
     </ScrollView>}
 
     {!!busy && <View style={styles.busyOverlay}><View style={styles.busyCard}><ActivityIndicator color={theme.primary} size="small" /><Text style={styles.busyText}>{busy}</Text></View></View>}
+    {!!importProgress && <View style={styles.importOverlay}><View style={[styles.importCard, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]}><View style={[styles.importIcon, { backgroundColor: theme.primaryContainer }]}><Ionicons name="file-tray-stacked-outline" size={30} color={theme.primary} /></View><Text style={[styles.importTitle, { color: theme.onPrimaryContainer }]}>Preparando sua base de estoque</Text><Text style={[styles.importStage, { color: theme.primary }]}>{importProgress.stage}</Text><View style={[styles.importTrack, { backgroundColor: theme.surfaceVariant }]}><View style={[styles.importFill, { width: `${Math.round(Math.max(0.02, Math.min(1, importProgress.percent)) * 100)}%`, backgroundColor: theme.primary }]} /></View><View style={styles.importPercentRow}><Text style={[styles.importPercent, { color: theme.onPrimaryContainer }]}>{Math.round(importProgress.percent * 100)}%</Text><Text style={styles.importEta}>{importProgress.etaSeconds !== undefined ? `Restante aprox.: ${formatEta(importProgress.etaSeconds)}` : 'Calculando tempo restante…'}</Text></View><View style={styles.importTimeRow}><Text style={styles.importTimeText}>Decorrido: {formatElapsed(importProgress.elapsedSeconds || 0)}</Text>{importProgress.rowsPerSecond !== undefined ? <Text style={styles.importTimeText}>Média: {importProgress.rowsPerSecond.toLocaleString('pt-BR')} linhas/s</Text> : null}</View>{importProgress.rowsProcessed !== undefined && <View style={styles.importStats}><View style={styles.importStat}><Text style={styles.importStatValue}>{importProgress.rowsProcessed.toLocaleString('pt-BR')}</Text><Text style={styles.importStatLabel}>Linhas lidas</Text></View>{importProgress.totalRows ? <View style={styles.importStat}><Text style={styles.importStatValue}>{importProgress.totalRows.toLocaleString('pt-BR')}</Text><Text style={styles.importStatLabel}>Linhas estimadas</Text></View> : null}{importProgress.saved !== undefined ? <View style={styles.importStat}><Text style={styles.importStatValue}>{importProgress.saved.toLocaleString('pt-BR')}</Text><Text style={styles.importStatLabel}>Produtos válidos</Text></View> : null}</View>}<Text style={styles.importHint}>O processamento acontece no aparelho. Você pode cancelar; sua base anterior será preservada.</Text><ActionButton title="Cancelar importação" onPress={cancelImport} secondary primaryColor={theme.primary} /></View></View>}
   </View>;
 }
 
@@ -818,5 +926,5 @@ const styles = StyleSheet.create({
   previewControls: { flexDirection: 'row', alignSelf: 'flex-start', padding: 3, borderRadius: 8, backgroundColor: '#F0F4F1', gap: 3 }, previewToggle: { paddingHorizontal: 13, paddingVertical: 7, borderRadius: 6 }, previewToggleActive: { backgroundColor: '#FFFFFF' }, previewToggleText: { color: MUTED, fontSize: 10, fontWeight: '700' }, previewToggleTextActive: { color: GREEN }, labelStage: { backgroundColor: '#F6F8F6', padding: 12, borderRadius: 12, alignItems: 'center', gap: 8 }, labelPreview: { width: '100%', maxWidth: 400, minHeight: 225, backgroundColor: '#FFFFFF', borderWidth: 2, borderColor: '#111111' }, labelPreviewCompact: { maxWidth: 310, minHeight: 190 }, labelTop: { height: 54, flexDirection: 'row', borderBottomWidth: 2, borderColor: '#111111' }, logoCell: { width: '29%', borderRightWidth: 2, borderColor: '#111111', justifyContent: 'center', alignItems: 'center' }, logoText: { fontSize: 21, fontWeight: '900', letterSpacing: -1.7, color: '#1E2421' }, logoSub: { fontSize: 6, color: '#1E2421', fontWeight: '900', letterSpacing: 1 }, codeCell: { flex: 1, paddingHorizontal: 8, paddingVertical: 4, justifyContent: 'space-between' }, labelSmall: { fontSize: 9, color: '#111111', fontWeight: '800' }, labelCode: { textAlign: 'center', fontSize: 19, fontWeight: '900', color: '#111111', marginBottom: 2 }, itemCell: { flex: 1, paddingHorizontal: 7, paddingTop: 5, paddingBottom: 7, borderBottomWidth: 2, borderColor: '#111111', justifyContent: 'space-between' }, labelName: { fontSize: 17, lineHeight: 23, color: '#111111', fontWeight: '900', textAlign: 'center', marginHorizontal: 7, marginVertical: 8 }, labelBottom: { minHeight: 60, flexDirection: 'row' }, bottomCell: { flex: 1, padding: 4 }, labelNav: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 16 }, navCircle: { width: 30, height: 30, borderRadius: 15, backgroundColor: '#F1F5F2', alignItems: 'center', justifyContent: 'center' }, navCount: { color: INK, fontSize: 11, fontWeight: '800' },
   emptyState: { alignItems: 'center', paddingVertical: 22, gap: 6 }, emptyTitle: { color: INK, fontSize: 12, fontWeight: '800' }, itemList: { gap: 10 }, itemEditor: { borderWidth: 1, borderColor: LINE, borderRadius: 11, padding: 10, gap: 5, backgroundColor: '#FCFDFC' }, itemEditorTop: { flexDirection: 'row', alignItems: 'center', gap: 9, marginBottom: 3 }, itemNumber: { color: GREEN, fontSize: 10, fontWeight: '900' }, itemStock: { flex: 1, color: MUTED, fontSize: 9 }, editInput: { minHeight: 34, paddingHorizontal: 9, paddingVertical: 6, borderWidth: 1, borderColor: LINE, borderRadius: 7, color: INK, fontSize: 11, backgroundColor: '#FFFFFF' }, showPreviewLink: { flexDirection: 'row', alignItems: 'center', gap: 5, alignSelf: 'flex-start', paddingTop: 3 }, showPreviewText: { color: GREEN, fontSize: 9, fontWeight: '800' }, exportBox: { borderTopWidth: 1, borderColor: LINE, paddingTop: 13, marginTop: 2, gap: 10 }, exportTitle: { color: INK, fontSize: 13, fontWeight: '900' }, exportRow: { flexDirection: 'row', alignItems: 'center', gap: 12 }, pageInputWrap: { width: 78 }, pageInput: { borderWidth: 1, borderColor: LINE, borderRadius: 8, padding: 7, color: INK, fontWeight: '800', textAlign: 'center', minHeight: 34 }, exportButtons: { flexDirection: 'row', gap: 8 }, successText: { color: GREEN, fontSize: 9, fontWeight: '700' },
   footer: { alignItems: 'center', gap: 5, paddingTop: 12 }, footerText: { color: '#9BA79F', fontSize: 8, letterSpacing: 0.5 }, busyOverlay: { position: 'absolute', top: 0, bottom: 0, left: 0, right: 0, backgroundColor: 'rgba(244,247,244,0.55)', justifyContent: 'center', alignItems: 'center' }, busyCard: { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: '#FFFFFF', paddingHorizontal: 16, paddingVertical: 13, borderRadius: 12, borderWidth: 1, borderColor: LINE, elevation: 5 }, busyText: { color: INK, fontSize: 11, fontWeight: '800' },
-  cameraContainer: { gap: 9 }, camera: { height: 230, width: '100%', borderRadius: 12, overflow: 'hidden' }, cameraPermission: { height: 160, borderRadius: 12, backgroundColor: '#F2F7F3', justifyContent: 'center', alignItems: 'center', gap: 10 }, scanName: { fontSize: 11, fontWeight: '700', color: GREEN, paddingVertical: 4 }, stepChoices: { flexDirection: 'row', gap: 8 }, stepChoice: { flex: 1, padding: 11, borderRadius: 9, borderWidth: 1, borderColor: LINE, alignItems: 'center' }, stepChoiceActive: { borderColor: '#8AB99B', backgroundColor: '#EFF7F1' }, stepChoiceText: { color: MUTED, fontSize: 11, fontWeight: '800' }, stepChoiceTextActive: { color: GREEN }, countRow: { flexDirection: 'row', alignItems: 'center', borderBottomWidth: 1, borderColor: LINE, paddingVertical: 10, gap: 10 }, countName: { fontSize: 11, color: INK, fontWeight: '800' }, countValue: { color: GREEN, fontWeight: '900', fontSize: 20, minWidth: 48, textAlign: 'right' }, noteCard: { flexDirection: 'row', alignItems: 'flex-start', backgroundColor: '#F0F7F2' }, noteText: { color: '#506C5D', fontSize: 10, lineHeight: 16, flex: 1 },
+  importOverlay: { position: 'absolute', top: 0, bottom: 0, left: 0, right: 0, zIndex: 30, backgroundColor: 'rgba(20,28,24,0.42)', alignItems: 'center', justifyContent: 'center', padding: 22 }, importCard: { width: '100%', maxWidth: 430, borderWidth: 1, borderRadius: 24, padding: 22, alignItems: 'center', gap: 13, elevation: 12 }, importIcon: { width: 64, height: 64, borderRadius: 22, alignItems: 'center', justifyContent: 'center' }, importTitle: { fontSize: 19, fontWeight: '900', textAlign: 'center' }, importStage: { fontSize: 12, fontWeight: '800', textAlign: 'center', minHeight: 18 }, importTrack: { width: '100%', height: 11, borderRadius: 20, overflow: 'hidden' }, importFill: { height: '100%', borderRadius: 20 }, importPercentRow: { width: '100%', flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }, importPercent: { fontSize: 19, fontWeight: '900' }, importEta: { color: MUTED, fontSize: 11, fontWeight: '700' }, importTimeRow: { width: '100%', flexDirection: 'row', justifyContent: 'space-between', gap: 8 }, importTimeText: { color: MUTED, fontSize: 10, fontWeight: '700' }, importStats: { width: '100%', flexDirection: 'row', justifyContent: 'space-around', gap: 7, paddingVertical: 8, borderTopWidth: 1, borderBottomWidth: 1, borderColor: LINE }, importStat: { alignItems: 'center', flex: 1 }, importStatValue: { color: INK, fontSize: 14, fontWeight: '900' }, importStatLabel: { color: MUTED, fontSize: 9, textAlign: 'center' }, importHint: { color: MUTED, fontSize: 10, lineHeight: 15, textAlign: 'center' }, cameraContainer: { gap: 9 }, camera: { height: 230, width: '100%', borderRadius: 12, overflow: 'hidden' }, cameraPermission: { height: 160, borderRadius: 12, backgroundColor: '#F2F7F3', justifyContent: 'center', alignItems: 'center', gap: 10 }, scanName: { fontSize: 11, fontWeight: '700', color: GREEN, paddingVertical: 4 }, stepChoices: { flexDirection: 'row', gap: 8 }, stepChoice: { flex: 1, padding: 11, borderRadius: 9, borderWidth: 1, borderColor: LINE, alignItems: 'center' }, stepChoiceActive: { borderColor: '#8AB99B', backgroundColor: '#EFF7F1' }, stepChoiceText: { color: MUTED, fontSize: 11, fontWeight: '800' }, stepChoiceTextActive: { color: GREEN }, countRow: { flexDirection: 'row', alignItems: 'center', borderBottomWidth: 1, borderColor: LINE, paddingVertical: 10, gap: 10 }, countName: { fontSize: 11, color: INK, fontWeight: '800' }, countValue: { color: GREEN, fontWeight: '900', fontSize: 20, minWidth: 48, textAlign: 'right' }, noteCard: { flexDirection: 'row', alignItems: 'flex-start', backgroundColor: '#F0F7F2' }, noteText: { color: '#506C5D', fontSize: 10, lineHeight: 16, flex: 1 },
 });

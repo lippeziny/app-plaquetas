@@ -29,3 +29,27 @@ Esta alteração corrige a causa identificada no log. A compilação nativa prec
 ## v4.2.1 — correção da importação de modelo PowerPoint
 
 O fluxo de importação do modelo personalizado ainda chamava a função removida `readPickedFileBase64`. A chamada foi alinhada ao leitor binário atual: `bytesToBase64(await readPickedFileBytes(asset))`. Foi incluída uma asserção de regressão para exigir esse caminho e impedir referências à função antiga.
+
+
+## v4.3 — importador incremental otimizado
+
+- Substituída a importação em workbook inteiro por extração seletiva dos XMLs de XLSX e parser SAX em blocos de 256 KB.
+- Mantidas apenas as colunas configuradas; padrão A (código), B (descrição) e D (quantidade).
+- Strings compartilhadas são varridas em fluxo e persistidas no staging somente quando referenciadas pelos campos selecionados.
+- Banco SQLite recebe lotes e usa índices de referência para reduzir o custo da procura de shared strings.
+- A base anterior permanece intacta até a substituição transacional no fim; cancelamento/falha limpa apenas staging.
+- Formatos numéricos simples como 000000 são aplicados para preservar zeros à esquerda em códigos.
+- Decodificador UTF-8 em fluxo suporta sequências divididas entre blocos e não depende de TextDecoder global.
+- Barra de progresso agora mostra etapa, percentual, linhas, tempo decorrido, média de linhas/s e ETA.
+- Removido o limite rígido de 50 MB. O limite efetivo depende do armazenamento livre, tamanho descompactado e recursos do aparelho.
+- Necessário rebuild nativo após instalar react-native-zip-archive (Android e iOS; mínimo iOS 15.5).
+
+
+### v4.3 — otimização adicional da leitura de strings e progresso
+
+- A relação de IDs compartilhados necessários é obtida com `getEachAsync()` no SQLite, sem materializar o resultado completo com `getAllAsync()`.
+- IDs ordenados são armazenados em `Uint32Array` (4 bytes por ID) e o SAX parser captura apenas as strings referenciadas; a leitura antecipadamente assim que o último ID é localizado.
+- Inserções de shared strings deixaram de executar uma verificação `EXISTS` contra todas as linhas a cada lote; o filtro acontece antes, no parser.
+- Linhas completamente vazias nas colunas selecionadas não são armazenadas em staging. Os lotes de gravação da planilha foram ampliados para até 1.000 linhas e os lotes da etapa de consolidação para 2.000 linhas, reduzindo transações frequentes sem aumentar significativamente o pico de memória.
+- Tempo decorrido e ETA são atualizados a cada segundo, inclusive durante etapas longas sem callback de progresso. O cursor de IDs também verifica o cancelamento periodicamente.
+- O mapeamento inicial segue A = código, B = nome e D = quantidade; o usuário ainda pode ajustar as colunas na tela.

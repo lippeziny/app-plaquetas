@@ -16,7 +16,6 @@ function workbookRows(workbook: ParsedWorkbook, sheetName: string): string[][] {
     const usedRange = worksheet['!ref'];
     if (usedRange) {
       const range = XLSX.utils.decode_range(usedRange);
-      if (range.e.r > 250000) throw new Error('A aba selecionada ultrapassa 250 mil linhas. Filtre ou divida a planilha antes de importar no celular.');
     }
     const rows = XLSX.utils.sheet_to_json<unknown[]>(worksheet, { header: 1, raw: false, defval: '' });
     return rows.map(row => row.map(cellText));

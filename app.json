@@ -33,7 +33,16 @@
           "microphonePermission": false
         }
       ],
-      "expo-document-picker"
+      "expo-document-picker",
+      "react-native-zip-archive",
+      [
+        "expo-build-properties",
+        {
+          "ios": {
+            "deploymentTarget": "15.5"
+          }
+        }
+      ]
     ],
     "web": {
       "bundler": "metro",

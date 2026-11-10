@@ -48,9 +48,11 @@ npm start
 ## Dependências principais
 
 - Expo SDK 54 / React Native 0.81.
-- SheetJS (`xlsx`) para leitura local de planilhas.
-- JSZip para inspeção e geração local de PowerPoint.
-- Expo FileSystem para armazenamento privado no aparelho.
+- `react-native-zip-archive` para listar o pacote XLSX e extrair somente os XMLs relevantes da aba escolhida.
+- `saxes` para interpretar XML progressivamente em blocos, sem materializar a planilha inteira em memória.
+- Expo FileSystem para leitura incremental de arquivos e armazenamento temporário privado.
+- Expo SQLite para manter a base de produtos indexada e persistente, inclusive entre reinicializações.
+- JSZip para inspecionar e gerar localmente arquivos PowerPoint.
 - Expo Camera para leitura de códigos.
 - Expo Print e Expo Sharing para criação e compartilhamento de PDF/arquivos.
 
@@ -59,11 +61,26 @@ npm start
 A interface mobile não contém chamadas a uma API e não usa URL de backend. O manifesto Android bloqueia as permissões `INTERNET` e `ACCESS_NETWORK_STATE`. Planilhas, códigos, nomes, contagens e modelos são processados no aparelho. A câmera só é solicitada quando o usuário abre o leitor.
 
 
-## Importação de planilhas grandes (v4.2)
+## Importação otimizada de planilhas grandes (v4.3)
 
-A importação Excel no Android lê o arquivo como `Uint8Array` usando `File.bytes()` do Expo FileSystem, em vez de converter o arquivo completo para Base64 pela ponte nativa. O parser usa `dense: true` e mantém o workbook em memória, convertendo para linhas somente a aba selecionada pelo usuário. Para evitar encerramento por falta de memória, o seletor orienta reduzir arquivos acima de 50 MB e abas acima de 250 mil linhas. Isso reduz cópias e consumo de memória durante a leitura.
+O importador nativo não converte mais a planilha inteira para Base64 nem mantém um workbook completo na memória. Um arquivo `.xlsx` é aberto como pacote ZIP; o app extrai apenas o XML da aba escolhida, o catálogo de strings compartilhadas e os estilos. Os XMLs são lidos em blocos de 256 KB e o parser mantém apenas as colunas mapeadas (por padrão A = código, B = descrição e D = quantidade (ajustável)).
+
+Os registros brutos são gravados em lotes de até 1.000 linhas no SQLite. Antes de ler as strings compartilhadas, o app consulta os IDs realmente usados nas colunas selecionadas em um cursor SQLite incremental; a lista de IDs fica em um vetor tipado compacto. O parser pula o texto das demais strings e encerra a leitura assim que encontra o último ID necessário. Em seguida, aplica máscaras numéricas simples (por exemplo, `000000` para preservar zeros à esquerda) e monta a nova base em tabelas temporárias indexadas. A base anterior só é substituída em uma transação depois que todas as etapas terminam. Cancelar ou falhar durante a leitura preserva o catálogo anterior.
+
+A tela de importação mostra a etapa atual, progresso aproximado, quantidade de linhas, tempo decorrido atualizado a cada segundo, velocidade média e estimativa restante suavizada. A leitura pode ser cancelada. Não há mais um limite artificial de 50 MB; o tamanho prático passa a depender do armazenamento livre, da complexidade/expansão do XLSX e dos recursos do aparelho. Arquivos muito grandes ainda podem levar tempo porque o conteúdo XML e as strings precisam ser percorridos, mas a memória é mantida limitada por blocos e lotes.
+
+O importador incremental exige uma nova compilação nativa, porque usa `react-native-zip-archive`. O pacote v9 requer iOS 15.5 ou superior e um rebuild Android/iOS após sua inclusão.
 
 
 ### Correção v4.2.1
 
 A importação de modelos PowerPoint personalizados também lê o arquivo como bytes (`ExpoFile.bytes()`) e só converte para Base64 para o processamento interno do PPTX. Isso elimina a chamada obsoleta `readPickedFileBase64` que causava erro de TypeScript.
+
+### Versão v4.3 — importador incremental
+
+- Leitura seletiva do ZIP/XML de `.xlsx` em blocos de 256 KB; por padrão considera somente as colunas A, B e D, com mapeamento editável.
+- IDs de strings compartilhadas coletados via cursor SQLite e representados em `Uint32Array`; o parser captura apenas textos referenciados e pode parar assim que encontra o último ID necessário.
+- Gravação SQLite em lotes, índices de referência e substituição transacional da base.
+- Preservação de códigos com zeros à esquerda em formatos numéricos simples.
+- Tela de progresso com etapa, percentual, linhas lidas, duração atualizada a cada segundo, média de linhas por segundo, ETA suavizada e cancelamento.
+- Sem limite fixo de 50 MB; o teto prático é limitado pelo espaço de armazenamento e capacidade do dispositivo.

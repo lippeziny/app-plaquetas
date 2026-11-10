@@ -27,6 +27,8 @@ function loadTypeScriptModule(relativePath) {
 const pptxTools = loadTypeScriptModule('../offline/pptx.ts');
 const workbookTools = loadTypeScriptModule('../offline/workbook.ts');
 const pdfTools = loadTypeScriptModule('../offline/pdf.ts');
+const xlsxXmlTools = loadTypeScriptModule('../offline/xlsx-xml.ts');
+const utf8Tools = loadTypeScriptModule('../offline/utf8-stream.ts');
 const templatePath = path.resolve(__dirname, '..', 'assets', 'default-template.pptx');
 
 test('inspects the bundled template locally and finds both 8-label layouts', async () => {
@@ -130,6 +132,80 @@ test('imports Excel locally and suggests code, description and quantity columns'
   });
 });
 
+async function* textChunks(text, chunkSize = 23) {
+  for (let index = 0; index < text.length; index += chunkSize) yield text.slice(index, index + chunkSize);
+}
+
+test('streams XLSX workbook metadata and resolves worksheet relationship paths', () => {
+  const workbook = `<?xml version="1.0"?><workbook xmlns:r="urn:r"><sheets><sheet name="ESTOQUE SAP" sheetId="1" r:id="rId1"/></sheets></workbook>`;
+  const rels = `<?xml version="1.0"?><Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>`;
+  const sheets = xlsxXmlTools.parseWorkbookXml(workbook);
+  const relationships = xlsxXmlTools.parseWorkbookRelationshipsXml(rels);
+  assert.deepEqual(sheets, [{ name: 'ESTOQUE SAP', relationId: 'rId1' }]);
+  assert.equal(xlsxXmlTools.resolveWorksheetPath(`xl/${relationships.rId1}`), 'xl/worksheets/sheet1.xml');
+});
+
+test('reads only selected XLSX columns A, B and D in bounded chunks', async () => {
+  const xml = `<?xml version="1.0"?><worksheet><dimension ref="A1:D4"/><sheetData>
+    <row r="1"><c r="A1" t="inlineStr"><is><t>Código</t></is></c><c r="B1" t="inlineStr"><is><t>Descrição</t></is></c><c r="D1" t="inlineStr"><is><t>Quantidade</t></is></c></row>
+    <row r="2"><c r="A2" t="s"><v>0</v></c><c r="B2" t="s"><v>1</v></c><c r="C2"><v>IGNORAR</v></c><c r="D2"><v>17</v></c></row>
+    <row r="3"><c r="A3" t="s"><v>2</v></c><c r="B3" t="s"><v>3</v></c><c r="D3"><v>9</v></c></row>
+  </sheetData></worksheet>`;
+  const received = [];
+  const result = await xlsxXmlTools.parseWorksheetToImportRows(
+    textChunks(xml, 19),
+    { codeColumn: 1, nameColumn: 2, quantityColumn: 4 },
+    async batch => received.push(...batch),
+  );
+  assert.equal(result.rowsRead, 2);
+  assert.equal(result.totalRows, 4);
+  assert.deepEqual(received.map(row => [row.rowNumber, row.codeRaw, row.nameRaw, row.quantityRaw]), [
+    [2, '0', '1', '17'], [3, '2', '3', '9'],
+  ]);
+  assert.ok(received.every(row => !Object.values(row).includes('IGNORAR')));
+});
+
+test('preserves Excel numeric formats for identifiers with leading zeroes', () => {
+  const styles = `<styleSheet><numFmts><numFmt numFmtId="164" formatCode="000000"/><numFmt numFmtId="165" formatCode="000-000"/></numFmts><cellXfs><xf numFmtId="0"/><xf numFmtId="164"/><xf numFmtId="165"/></cellXfs></styleSheet>`;
+  const formats = xlsxXmlTools.parseStylesXml(styles);
+  assert.equal(xlsxXmlTools.formatExcelValue('123', 'n:1', formats[1]), '000123');
+  assert.equal(xlsxXmlTools.formatExcelValue('123', 'n:2', formats[2]), '000-123');
+  assert.equal(xlsxXmlTools.formatExcelValue('17', 'n:0', formats[0]), '17');
+});
+
+test('decodes UTF-8 correctly when a multi-byte character crosses a 256KB chunk boundary', () => {
+  const { Utf8StreamDecoder } = utf8Tools;
+  const decoder = new Utf8StreamDecoder();
+  const encoder = new TextEncoder();
+  const source = `A`.repeat(256 * 1024 - 2) + 'ação — estoque';
+  const bytes = encoder.encode(source);
+  const first = decoder.decode(bytes.slice(0, 256 * 1024), false);
+  const second = decoder.decode(bytes.slice(256 * 1024), false);
+  const tail = decoder.decode(new Uint8Array(0), true);
+  assert.equal(first + second + tail, source);
+});
+
+test('streams shared strings in batches, selects only referenced IDs and preview stops after the sample rows', async () => {
+  const shared = `<sst><si><t>00123</t></si><si><t>MOTOR ELÉTRICO</t></si><si><t>00456</t></si><si><t>ROLAMENTO</t></si><si><t>STRING NÃO UTILIZADA</t></si></sst>`;
+  const imported = [];
+  const parsed = await xlsxXmlTools.parseSharedStrings(textChunks(shared, 13), async batch => imported.push(...batch));
+  assert.equal(parsed.count, 5);
+  assert.deepEqual(imported.map(item => item.value), ['00123', 'MOTOR ELÉTRICO', '00456', 'ROLAMENTO', 'STRING NÃO UTILIZADA']);
+
+  const selected = [];
+  const selectedResult = await xlsxXmlTools.parseSharedStrings(
+    textChunks(shared, 11), async batch => selected.push(...batch), undefined, undefined, [0, 3],
+  );
+  assert.equal(selectedResult.count, 2);
+  assert.deepEqual(selected.map(item => [item.id, item.value]), [[0, '00123'], [3, 'ROLAMENTO']]);
+
+  const previewXml = `<worksheet><dimension ref="A1:D9999"/><sheetData><row r="1"><c r="A1"><v>header</v></c></row><row r="2"><c r="A2"><v>one</v></c></row><row r="3"><c r="A3"><v>not-read</v></c></row></sheetData></worksheet>`;
+  const preview = await xlsxXmlTools.readPreviewRows(textChunks(previewXml, 92), 2);
+  assert.equal(preview.totalRows, 9999);
+  assert.equal(preview.rows.length, 2);
+  assert.equal(preview.rows[1].cells.get(1).value, 'one');
+});
+
 test('builds a local print document and escapes imported text', () => {
   const html = pdfTools.buildLabelsPdfHtml([
     { code: '001', name: 'PEÇA <ESPECIAL> & TESTE' },
@@ -148,9 +224,23 @@ test('mobile app contains no backend API calls and blocks Android network permis
   assert.match(app, /OFFLINE/);
   assert.match(app, /readPickedFileBytes/);
   assert.match(app, /bytesToBase64\(await readPickedFileBytes\(asset\)\)/, 'custom PowerPoint templates must use the byte reader before Base64 encoding');
-  assert.match(app, /maxImportBytes/);
-  assert.match(app, /50 MB/);
+  assert.doesNotMatch(app, /maxImportBytes|50 MB|250 mil linhas/, 'the native importer must not impose an arbitrary file/row size cap');
+  assert.match(app, /inspectXlsxFile/);
+  assert.match(app, /importXlsxSheetToCatalog/);
+  assert.match(app, /etaSeconds/);
+  assert.match(app, /setInterval\(\(\) =>/ , 'elapsed time and ETA must refresh while a long import stage is processing');
   assert.doesNotMatch(app, /readPickedFileBase64\(asset\)/, 'Excel import must not cross the native bridge as Base64 text');
+  const importer = fs.readFileSync(path.join(root, 'offline', 'streaming-xlsx.ts'), 'utf8');
+  assert.match(importer, /suggested: \{ codeColumn: 1, nameColumn: 2, quantityColumn: 4 \}/, 'stock import defaults to A/B/D');
+  assert.match(importer, /getNeededSharedStringIds/);
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+  assert.ok(pkg.dependencies['expo-sqlite']);
+  assert.ok(pkg.dependencies['react-native-zip-archive']);
+  assert.ok(pkg.dependencies.saxes);
+  assert.ok(pkg.dependencies['expo-file-system']);
+  assert.ok(pkg.devDependencies.xlsx, 'SheetJS must not be bundled in the production app runtime');
+  assert.ok(config.expo.plugins.includes('react-native-zip-archive'));
+  assert.equal(config.expo.plugins.find(entry => Array.isArray(entry) && entry[0] === 'expo-build-properties')[1].ios.deploymentTarget, '15.5');
   assert.ok(config.expo.android.blockedPermissions.includes('android.permission.INTERNET'));
   assert.ok(config.expo.android.blockedPermissions.includes('android.permission.ACCESS_NETWORK_STATE'));
 });
@@ -159,7 +249,7 @@ test('app exposes the real template preview, global/individual adjustments and M
   const root = path.resolve(__dirname, '..');
   const app = fs.readFileSync(path.join(root, 'App.tsx'), 'utf8');
   const preview = fs.readFileSync(path.join(root, 'offline', 'TemplatePreview.tsx'), 'utf8');
-  for (const text of ['Todas as plaquetas', 'Só uma plaqueta', 'Precisão do movimento', 'Ajustar posição do texto']) assert.ok(app.includes(text));
+  for (const text of ['Todas as plaquetas', 'Só uma plaqueta', 'Precisão do movimento', 'Ajustar posição do texto', 'Decorrido:', 'linhas/s']) assert.ok(app.includes(text));
   for (const theme of ["id: 'azul'", "id: 'verde'", "id: 'roxo'", "id: 'laranja'", "id: 'turquesa'"]) assert.ok(app.includes(theme));
   assert.match(app, /<TemplatePreview/);
   assert.match(preview, /visual\.imageBase64/);
