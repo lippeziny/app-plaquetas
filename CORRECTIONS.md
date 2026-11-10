@@ -30,3 +30,8 @@
 - Não foi possível executar `npm install`, `npm test`, Gradle ou Xcode nesta sessão porque o acesso ao registry npm falhou por `EAI_AGAIN`; portanto, esta revisão não é apresentada como build nativo concluído. O workflow continuará usando `npm install` e gerará o lockfile de trabalho no runner; nenhum `package-lock.json` falso foi criado.
 - Os logs mais recentes mostram que Android e simulador iOS pararam em `expo install --check` por causa do Picker fora da versão recomendada. Não mostram uma compilação nativa concluída nem incluem `logcat`; portanto, ainda não existe evidência de teste do APK corrigido em aparelho físico.
 - O job `ios-ipa` não aparece nessa execução; somente o simulador foi acionado. Para IPA é preciso definir `BUILD_IOS_IPA=true` e cadastrar os Secrets/Variables Apple descritos no README.
+
+
+## Correção v3 — TypeScript `TemplateSlide.orientation`
+
+O backend (`server/lib/pptx.cjs`) já devolve `orientation` como `portrait` ou `landscape` na inspeção do modelo PowerPoint. O tipo `TemplateSlide` do aplicativo não declarava essa propriedade, causando o erro TS2339 no passo `npm run typecheck`. A propriedade foi adicionada ao tipo com a união literal correspondente.

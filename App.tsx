@@ -26,6 +26,7 @@ type TemplateSlide = {
   capacity: number;
   widthEmu: number;
   heightEmu: number;
+  orientation: 'portrait' | 'landscape';
   nameFields: TemplateField[];
   codeFields: TemplateField[];
   shapes: { id: string; shape: string; text: string; field: string | null }[];
