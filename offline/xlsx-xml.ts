@@ -278,7 +278,7 @@ export async function readSelectedSharedStrings(
 
 export async function parseWorksheetToImportRows(
   chunks: AsyncIterable<string>,
-  mapping: { codeColumn: number; nameColumn: number; quantityColumn: number },
+  mapping: { codeColumn: number; nameColumn: number; quantityColumn: number; headerRow?: number },
   writeBatch: (rows: RawImportRow[]) => Promise<void>,
   shouldCancel?: () => boolean,
   onProgress?: (progress: { bytesRead: number; totalRows?: number; rowsRead: number }) => void,
@@ -288,7 +288,7 @@ export async function parseWorksheetToImportRows(
   let totalRows: number | undefined;
   let rowsRead = 0;
   let bytesRead = 0;
-  let firstSheetRow = true;
+  const headerRow = Math.max(1, Math.floor(mapping.headerRow || 1));
   let currentRow: { rowNumber: number; cells: Map<number, { value: string; type: string }> } | null = null;
   let currentCell: { col: number; type: string; value: string } | null = null;
   let capture: 'v' | 't' | null = null;
@@ -315,12 +315,9 @@ export async function parseWorksheetToImportRows(
       currentCell = null;
     }
     if (name === 'row' && currentRow) {
-      if (firstSheetRow) {
-        // The first physical row is treated as the header, matching the original importer.
-        firstSheetRow = false;
-        currentRow = null;
-        return;
-      }
+      // Ignore preamble rows and the detected header row. This supports workbooks
+      // where a title or report heading appears before the actual column names.
+      if (currentRow.rowNumber <= headerRow) { currentRow = null; return; }
       const pick = (column: number) => currentRow?.cells.get(column) || { value: '', type: '' };
       const code = pick(mapping.codeColumn);
       const itemName = pick(mapping.nameColumn);

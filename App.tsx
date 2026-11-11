@@ -25,8 +25,9 @@ import TemplatePreview from './offline/TemplatePreview';
 import { buildLabelsPdfHtml } from './offline/pdf';
 import { normalizeSearch } from './offline/text';
 import { cleanupWorkbookFile, importXlsxSheetToCatalog, inspectXlsxFile, previewXlsxSheet, type WorkbookFileSource, type ImportProgress } from './offline/streaming-xlsx';
-import { findCatalogByCode, findCatalogItems, getCatalogCount, getCatalogPage, initializeCatalogStore, replaceCatalogFromItems, searchCatalogSuggestions } from './offline/catalog-db';
+import { countStockCatalogMatches, findCatalogByCode, findCatalogItems, getCatalogCount, initializeCatalogStore, replaceCatalogFromItems, searchCatalogSuggestions, searchStockCatalogPage } from './offline/catalog-db';
 import { EMPTY_LOCAL_DATA, readLocalData, writeLocalData, type StoredAppData } from './offline/storage';
+import { chooseDefaultStockSheet, type StockColumnMapping } from './offline/stock-detection';
 import { Ionicons } from '@expo/vector-icons';
 
 type TemplateField = { id: string; shape: string; sample: string };
@@ -44,7 +45,7 @@ type TemplateSlide = {
 type TemplateInfo = { templateId: string; name: string; slides: TemplateSlide[] };
 type CatalogItem = { code: string; name: string; quantity?: string; sheetName?: string };
 type LabelItem = CatalogItem & { localId: string; sourceInput?: string };
-type WorkbookPreview = { headers: string[]; rows: string[][]; columns: { index: number; label: string }[]; suggested: { codeColumn: number; nameColumn: number; quantityColumn: number } };
+type WorkbookPreview = { headers: string[]; rows: string[][]; columns: { index: number; label: string }[]; suggested: StockColumnMapping };
 type ExportResult = { fileName: string; format: string; pages: number; capacity: number; printedItems: number; remainingItems: number };
 
 declare const require: (path: string) => any;
@@ -223,6 +224,7 @@ function AppScreen() {
   const [databaseFile, setDatabaseFile] = useState('');
   const [sheetNames, setSheetNames] = useState<string[]>([]);
   const [sheetName, setSheetName] = useState('');
+  const [headerRow, setHeaderRow] = useState(1);
   const [workbookPreview, setWorkbookPreview] = useState<WorkbookPreview | null>(null);
   const [workbookData, setWorkbookData] = useState<WorkbookFileSource | null>(null);
   const [catalogCount, setCatalogCount] = useState(0);
@@ -261,14 +263,17 @@ function AppScreen() {
   const [templateError, setTemplateError] = useState('');
   const [inputMode, setInputMode] = useState<'code' | 'name'>('code');
   const [inputText, setInputText] = useState('');
-  const [suggestions, setSuggestions] = useState<CatalogItem[]>([]);
-  const lastPickedSuggestionRef = useRef('');
+  const [quickSearchQuery, setQuickSearchQuery] = useState('');
+  const [quickSuggestions, setQuickSuggestions] = useState<CatalogItem[]>([]);
+  const [quickSelectedItem, setQuickSelectedItem] = useState<CatalogItem | null>(null);
+  const [quickSearchLoading, setQuickSearchLoading] = useState(false);
   const [catalogSearch, setCatalogSearch] = useState('');
   const catalogSearchRef = useRef('');
   const [catalogRows, setCatalogRows] = useState<CatalogItem[]>([]);
   const [catalogRowsLoading, setCatalogRowsLoading] = useState(false);
   const [catalogRowsOffset, setCatalogRowsOffset] = useState(0);
   const [catalogRowsHasMore, setCatalogRowsHasMore] = useState(false);
+  const [catalogFilteredCount, setCatalogFilteredCount] = useState(0);
   const [selectedCatalogRows, setSelectedCatalogRows] = useState<CatalogItem[]>([]);
   const [labels, setLabels] = useState<LabelItem[]>([]);
   const [activeLabelIndex, setActiveLabelIndex] = useState(0);
@@ -358,10 +363,43 @@ function AppScreen() {
         setDatabase({ ...saved.database, total: currentCatalogCount || saved.database.total, ready: currentCatalogCount > 0 || saved.database.ready });
         setTemplateAdjustments(saved.templateAdjustments || {});
         setThemeId(APP_THEMES.some(theme => theme.id === saved.themeId) ? (saved.themeId as string) : 'azul');
-        setDatabaseFile(saved.database.sourceFile || '');
+        setDatabaseFile(saved.stockWorkbookName || saved.database.sourceFile || '');
         setCounts(saved.counts);
         setTemplate(info);
         setTemplateBase64(base64);
+
+        // Restore the last stock workbook from the app's private documents folder.
+        // The imported SQLite catalog remains available even if the original XLSX was deleted.
+        if (saved.stockWorkbookUri && Platform.OS !== 'web') {
+          try {
+            const savedFileInfo = await FileSystem.getInfoAsync(saved.stockWorkbookUri);
+            if (savedFileInfo.exists) {
+              const restoredSource = await inspectXlsxFile(
+                saved.stockWorkbookUri,
+                saved.stockWorkbookName || saved.database.sourceFile || 'estoque.xlsx',
+              );
+              const restoredSheet = saved.selectedSheetName && restoredSource.sheetNames.includes(saved.selectedSheetName)
+                ? saved.selectedSheetName
+                : chooseDefaultStockSheet(restoredSource.sheetNames);
+              if (restoredSheet) {
+                const restoredPreview = await previewXlsxSheet(restoredSource, restoredSheet);
+                const restoredMapping = saved.stockColumnMappings?.[restoredSheet] || restoredPreview.suggested;
+                setWorkbookData(restoredSource);
+                setSheetNames(restoredSource.sheetNames);
+                setSheetName(restoredSheet);
+                setWorkbookPreview(restoredPreview);
+                setCodeColumn(restoredMapping.codeColumn || 1);
+                setNameColumn(restoredMapping.nameColumn || 2);
+                setQuantityColumn(restoredMapping.quantityColumn || 0);
+                setHeaderRow(restoredMapping.headerRow || restoredPreview.suggested.headerRow || 1);
+              }
+            } else {
+              console.warn('A cópia permanente da planilha de estoque não foi encontrada; a base SQLite salva continua disponível.');
+            }
+          } catch (restoreError) {
+            console.warn('Não foi possível reabrir a planilha original salva; a base SQLite continua disponível.', restoreError);
+          }
+        }
         setLocalReady(true);
         if (saved.templateUri && !saved.templateBase64 && !saved.templateName) {
           await persistPatch({ templateName: info.name });
@@ -373,17 +411,28 @@ function AppScreen() {
     return () => { alive = false; };
   }, [persistPatch]);
 
+  // One-item autocomplete is deliberately separate from the bulk-paste field.
+  // It queries the full imported SQLite stock catalogue on every keystroke.
   useEffect(() => {
-    const query = normalizeSearch(inputText.split(/[\n,;]+/).pop() || '');
-    if (query.length < 2 || query === lastPickedSuggestionRef.current || !localReady || !database.ready) { setSuggestions([]); return; }
+    const query = normalizeSearch(quickSearchQuery);
+    const selectedValue = quickSelectedItem
+      ? normalizeSearch(inputMode === 'code' ? quickSelectedItem.code : quickSelectedItem.name)
+      : '';
+    if (!query || query.length < 1 || query === selectedValue || !localReady || !database.ready) {
+      setQuickSuggestions([]);
+      setQuickSearchLoading(false);
+      return;
+    }
     let active = true;
     const timer = setTimeout(() => {
-      searchCatalogSuggestions(query, inputMode, 8)
-        .then(rows => { if (active) setSuggestions(rows); })
-        .catch(() => { if (active) setSuggestions([]); });
-    }, 160);
+      setQuickSearchLoading(true);
+      searchCatalogSuggestions(query, inputMode, 10)
+        .then(rows => { if (active) setQuickSuggestions(rows); })
+        .catch(() => { if (active) setQuickSuggestions([]); })
+        .finally(() => { if (active) setQuickSearchLoading(false); });
+    }, 110);
     return () => { active = false; clearTimeout(timer); };
-  }, [inputText, inputMode, localReady, database.ready]);
+  }, [quickSearchQuery, quickSelectedItem, inputMode, localReady, database.ready]);
 
   // The browseable stock list is paginated, so a catalog with hundreds of
   // thousands of products never gets materialized in React memory at once.
@@ -392,6 +441,7 @@ function AppScreen() {
       setCatalogRows([]);
       setCatalogRowsOffset(0);
       setCatalogRowsHasMore(false);
+      setCatalogFilteredCount(0);
       setCatalogRowsLoading(false);
       return;
     }
@@ -399,11 +449,17 @@ function AppScreen() {
     const timer = setTimeout(async () => {
       setCatalogRowsLoading(true);
       try {
-        const rows = await getCatalogPage(catalogSearch, 60, 0);
+        // This query is intentionally against the complete SQLite stock catalog,
+        // never against `labels` (the products already selected for printing).
+        const [rows, matchingCount] = await Promise.all([
+          searchStockCatalogPage(catalogSearch, 60, 0),
+          countStockCatalogMatches(catalogSearch),
+        ]);
         if (!active) return;
         setCatalogRows(rows);
+        setCatalogFilteredCount(matchingCount);
         setCatalogRowsOffset(rows.length);
-        setCatalogRowsHasMore(rows.length === 60);
+        setCatalogRowsHasMore(rows.length < matchingCount);
       } catch (error: any) {
         if (active) showMessage(error?.message || 'Não foi possível pesquisar a base de estoque.');
       } finally {
@@ -446,43 +502,114 @@ function AppScreen() {
     setImportProgress({ stage: 'Preparando importação segura', percent: 0.01 });
   };
 
+  const persistStockMapping = useCallback(async (name: string, mapping: StockColumnMapping) => {
+    const stockColumnMappings = { ...(localDataRef.current.stockColumnMappings || {}), [name]: mapping };
+    await persistPatch({ selectedSheetName: name, stockColumnMappings });
+  }, [persistPatch]);
+
+  const changeStockColumn = (field: 'codeColumn' | 'nameColumn' | 'quantityColumn', value: number) => {
+    const saved = sheetName ? localDataRef.current.stockColumnMappings?.[sheetName] : undefined;
+    const next: StockColumnMapping = {
+      codeColumn: saved?.codeColumn ?? codeColumn,
+      nameColumn: saved?.nameColumn ?? nameColumn,
+      quantityColumn: saved?.quantityColumn ?? quantityColumn,
+      headerRow: saved?.headerRow ?? headerRow,
+    };
+    next[field] = value;
+    if (field === 'codeColumn') setCodeColumn(value);
+    if (field === 'nameColumn') setNameColumn(value);
+    if (field === 'quantityColumn') setQuantityColumn(value);
+    if (sheetName) persistStockMapping(sheetName, next).catch(error => console.warn('Não foi possível salvar o mapeamento da aba:', error));
+  };
+
   const loadSheetPreview = useCallback(async (name: string) => {
     if (!workbookData || !name) return;
+    importControllerRef.current?.abort();
     const controller = new AbortController();
     importControllerRef.current = controller;
     try {
       startImportProgress();
       const preview = await previewXlsxSheet(workbookData, name, updateImportProgress, controller.signal);
       setWorkbookPreview(preview);
-      setCodeColumn(preview.suggested.codeColumn || 1);
-      setNameColumn(preview.suggested.nameColumn || 2);
-      setQuantityColumn(preview.suggested.quantityColumn || 4);
+      const savedMapping = localDataRef.current.stockColumnMappings?.[name];
+      const mapping = savedMapping || preview.suggested;
+      setCodeColumn(mapping.codeColumn || 1);
+      setNameColumn(mapping.nameColumn || 2);
+      setQuantityColumn(mapping.quantityColumn || 0);
+      setHeaderRow(mapping.headerRow || preview.suggested.headerRow || 1);
+      await persistStockMapping(name, mapping);
     } catch (error: any) { if (error?.message !== 'IMPORT_CANCELLED' && error?.code !== 'ERR_CANCELLED') showMessage(error.message); }
-    finally { importControllerRef.current = null; setImportProgress(null); }
-  }, [workbookData, updateImportProgress]);
+    finally { if (importControllerRef.current === controller) { importControllerRef.current = null; setImportProgress(null); } }
+  }, [workbookData, updateImportProgress, persistStockMapping]);
 
   const onChooseDatabase = async () => {
+    let copiedUri = '';
+    let inspectedSource: WorkbookFileSource | null = null;
     try {
       const asset = await chooseFile('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       if (!asset) return;
-      await cleanupWorkbookFile(workbookData);
-      setWorkbookData(null);
-      setWorkbookPreview(null);
+      const name = asset.name || 'estoque.xlsx';
+      const root = FileSystem.documentDirectory;
+      if (!root) throw new Error('O armazenamento interno do aparelho não está disponível para guardar sua planilha.');
+      const directory = `${root}stock-source/`;
+      await FileSystem.makeDirectoryAsync(directory, { intermediates: true });
+      const safeName = name.replace(/[^a-zA-Z0-9._-]/g, '_').replace(/\.xlsx$/i, '') || 'estoque';
+      copiedUri = `${directory}${safeName}-${Date.now()}.xlsx`;
       const controller = new AbortController();
       importControllerRef.current = controller;
       startImportProgress();
-      const source = await inspectXlsxFile(asset.uri, asset.name || 'estoque.xlsx', updateImportProgress, controller.signal);
-      setWorkbookData(source);
-      setDatabaseFile(asset.name || 'estoque.xlsx');
-      setSheetNames(source.sheetNames);
-      const first = source.sheetNames[0] || '';
-      setSheetName(first);
-      const preview = await previewXlsxSheet(source, first, updateImportProgress, controller.signal);
+      setImportProgress({ stage: 'Salvando uma cópia permanente da planilha no aparelho', percent: 0.02 });
+      await FileSystem.copyAsync({ from: asset.uri, to: copiedUri });
+
+      inspectedSource = await inspectXlsxFile(copiedUri, name, updateImportProgress, controller.signal);
+      setImportProgress(current => current ? { ...current, stage: 'Identificando automaticamente a aba de estoque', percent: Math.max(current.percent, 0.12) } : current);
+      const preferredSheet = chooseDefaultStockSheet(inspectedSource.sheetNames);
+      if (!preferredSheet) throw new Error('Não encontrei nenhuma aba válida nesta planilha.');
+      const preview = await previewXlsxSheet(inspectedSource, preferredSheet, updateImportProgress, controller.signal);
+      const mapping = preview.suggested;
+
+      const previousSource = workbookData;
+      const previousSavedUri = localDataRef.current.stockWorkbookUri;
+      const previousStoredData = localDataRef.current;
+      try {
+        await persistPatch({
+          stockWorkbookUri: copiedUri,
+          stockWorkbookName: name,
+          selectedSheetName: preferredSheet,
+          stockColumnMappings: { [preferredSheet]: mapping },
+        });
+      } catch (storageError) {
+        localDataRef.current = previousStoredData;
+        throw storageError;
+      }
+      // Publish the newly selected source to the screen only after the private copy
+      // and its metadata have both been saved successfully.
+      setWorkbookData(inspectedSource);
+      setDatabaseFile(name);
+      setSheetNames(inspectedSource.sheetNames);
+      setSheetName(preferredSheet);
       setWorkbookPreview(preview);
-      setCodeColumn(preview.suggested.codeColumn || 1);
-      setNameColumn(preview.suggested.nameColumn || 2);
-      setQuantityColumn(preview.suggested.quantityColumn || 4);
+      setCatalogSearch('');
+      catalogSearchRef.current = '';
+      setSelectedCatalogRows([]);
+      setCatalogRows([]);
+      setCatalogRowsOffset(0);
+      setCatalogRowsHasMore(false);
+      setCatalogFilteredCount(0);
+      setCodeColumn(mapping.codeColumn || 1);
+      setNameColumn(mapping.nameColumn || 2);
+      setQuantityColumn(mapping.quantityColumn || 0);
+      setHeaderRow(mapping.headerRow || 1);
+
+      // New source is safely persisted and inspected; now discard old temporary extraction data/file.
+      if (previousSource) await cleanupWorkbookFile(previousSource);
+      if (previousSavedUri && previousSavedUri !== copiedUri && previousSavedUri.startsWith(directory)) {
+        await FileSystem.deleteAsync(previousSavedUri, { idempotent: true }).catch(() => {});
+      }
+      inspectedSource = null; // ownership transferred to React state
     } catch (error: any) {
+      if (inspectedSource) await cleanupWorkbookFile(inspectedSource).catch(() => {});
+      if (copiedUri) await FileSystem.deleteAsync(copiedUri, { idempotent: true }).catch(() => {});
       if (error?.message !== 'IMPORT_CANCELLED' && error?.code !== 'ERR_CANCELLED') showMessage(error.message || 'Não foi possível ler essa planilha.');
     } finally {
       importControllerRef.current = null;
@@ -498,10 +625,11 @@ function AppScreen() {
     startImportProgress();
     try {
       const result = await importXlsxSheetToCatalog(
-        workbookData, sheetName, { codeColumn, nameColumn, quantityColumn }, updateImportProgress, controller.signal,
+        workbookData, sheetName, { codeColumn, nameColumn, quantityColumn, headerRow }, updateImportProgress, controller.signal,
       );
       const meta = { total: result.total, ready: result.total > 0, sheetName, sourceFile: databaseFile || 'planilha.xlsx' };
-      await persistPatch({ catalog: [], database: meta });
+      const stockColumnMappings = { ...(localDataRef.current.stockColumnMappings || {}), [sheetName]: { codeColumn, nameColumn, quantityColumn, headerRow } };
+      await persistPatch({ catalog: [], database: meta, stockWorkbookUri: localDataRef.current.stockWorkbookUri || workbookData.uri, stockWorkbookName: databaseFile || 'estoque.xlsx', selectedSheetName: sheetName, stockColumnMappings });
       setCatalogCount(result.total);
       setDatabase(meta);
       setSelectedCatalogRows([]);
@@ -510,13 +638,16 @@ function AppScreen() {
       setCatalogRows([]);
       setCatalogRowsOffset(0);
       setCatalogRowsHasMore(false);
-      await cleanupWorkbookFile(workbookData);
-      setWorkbookData(null);
-      setSheetNames([]);
-      setWorkbookPreview(null);
+      setCatalogFilteredCount(result.total);
+      setQuickSearchQuery('');
+      setQuickSelectedItem(null);
+      setQuickSuggestions([]);
+      setInputText('');
+      // Keep the persistent source workbook and current extracted worksheet available
+      // so the user can reopen the app or switch sheets without choosing the file again.
       setWorkflowStep('items');
       setImportProgress(null);
-      showMessage(`${result.total.toLocaleString('pt-BR')} produtos importados e salvos neste aparelho.${result.skipped ? ` ${result.skipped.toLocaleString('pt-BR')} linha(s) sem código ou descrição foram ignoradas.` : ''}`);
+      showMessage(`${result.total.toLocaleString('pt-BR')} produtos importados e salvos neste aparelho. A planilha original também foi mantida para a próxima abertura.${result.skipped ? ` ${result.skipped.toLocaleString('pt-BR')} linha(s) sem código ou descrição foram ignoradas.` : ''}`);
     } catch (error: any) {
       if (error?.message === 'IMPORT_CANCELLED') showMessage('Importação cancelada. A base anterior foi mantida.');
       else showMessage(error.message || 'Não foi possível concluir a importação. A base anterior foi preservada.');
@@ -574,8 +705,6 @@ function AppScreen() {
       setLabels(previous => [...previous, ...mapped]);
       setActiveLabelIndex(labels.length);
       setInputText('');
-      lastPickedSuggestionRef.current = '';
-      setSuggestions([]);
       const missing = entries.filter(entry => !entry.item).length;
       if (missing) showMessage(`${mapped.length - missing} item(ns) encontrado(s) na base local. ${missing} precisa(m) de revisão manual.`);
     } catch (error: any) { showMessage(error.message); }
@@ -583,16 +712,7 @@ function AppScreen() {
   };
 
   const handleInputTextChange = (value: string) => {
-    lastPickedSuggestionRef.current = '';
     setInputText(value);
-  };
-
-  const chooseSuggestion = (item: CatalogItem) => {
-    const before = inputText.split(/[\n,;]+/).slice(0, -1).join('\n');
-    const value = inputMode === 'code' ? item.code : item.name;
-    lastPickedSuggestionRef.current = normalizeSearch(value);
-    setInputText(`${before ? `${before}\n` : ''}${value}`);
-    setSuggestions([]);
   };
 
   const toggleCatalogRow = (item: CatalogItem) => {
@@ -618,6 +738,7 @@ function AppScreen() {
     setCatalogRows([]);
     setCatalogRowsOffset(0);
     setCatalogRowsHasMore(false);
+    setCatalogFilteredCount(0);
     setCatalogRowsLoading(!!database.ready);
   };
 
@@ -627,11 +748,11 @@ function AppScreen() {
     const requestOffset = catalogRowsOffset;
     setCatalogRowsLoading(true);
     try {
-      const rows = await getCatalogPage(requestQuery, 60, requestOffset);
+      const rows = await searchStockCatalogPage(requestQuery, 60, requestOffset);
       if (catalogSearchRef.current !== requestQuery) return;
       setCatalogRows(previous => [...previous, ...rows]);
       setCatalogRowsOffset(requestOffset + rows.length);
-      setCatalogRowsHasMore(rows.length === 60);
+      setCatalogRowsHasMore(requestOffset + rows.length < catalogFilteredCount);
     } catch (error: any) {
       if (catalogSearchRef.current === requestQuery) showMessage(error?.message || 'Não foi possível carregar mais produtos.');
     } finally {
@@ -802,19 +923,19 @@ function AppScreen() {
           <View style={[styles.materialIconCircle, { backgroundColor: theme.primaryContainer }]}><Ionicons name="document-text-outline" size={24} color={theme.primary} /></View>
           <View style={{ flex: 1, gap: 3 }}>
             <Text style={styles.uploadTitle}>{databaseFile || database.sourceFile || 'Nenhuma planilha selecionada'}</Text>
-            <Text style={styles.helper}>{database.ready ? `${catalogCount.toLocaleString('pt-BR')} registros · ${database.sheetName}` : 'Planilha Excel .xlsx com uma ou mais abas'}</Text>
+            <Text style={styles.helper}>{database.ready ? `${catalogCount.toLocaleString('pt-BR')} registros · aba ${database.sheetName}` : 'Planilha Excel .xlsx com uma ou mais abas'}{localDataRef.current.stockWorkbookUri ? ' · arquivo original salvo neste aparelho' : ''}</Text>
           </View>
         </View>
         <ActionButton title={database.ready ? 'Trocar planilha Excel' : 'Selecionar planilha Excel'} onPress={onChooseDatabase} icon="folder-open-outline" primaryColor={theme.primary} disabled={!!busy} />
         {sheetNames.length > 0 && <View style={styles.mappingBlock}>
-          <Text style={styles.fieldLabel}>1. Escolha a aba da planilha</Text>
+          <Text style={styles.fieldLabel}>1. Aba de estoque (detectada automaticamente)</Text><Text style={styles.helper}>A aba com “Estoque” no nome é priorizada. Sua última escolha fica salva para a próxima abertura.</Text>
           <View style={[styles.pickerWrap, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant }]}><Picker selectedValue={sheetName} onValueChange={(value) => { setSheetName(value); loadSheetPreview(value); }} style={styles.picker}><Picker.Item label="Selecione a aba" value="" />{sheetNames.map(name => <Picker.Item key={name} label={name} value={name} />)}</Picker></View>
           {workbookPreview && <>
-            <Text style={styles.fieldLabel}>2. Confira as colunas</Text><Text style={styles.helper}>Padrão do estoque: A = código, B = nome e D = quantidade. Você pode alterar o mapeamento abaixo.</Text>
+            <Text style={styles.fieldLabel}>2. Colunas identificadas pelos títulos</Text><Text style={styles.helper}>O app procura Número/Código, Descrição/Nome/Item e Quantidade/Estoque. Linha de cabeçalho detectada: {headerRow}. Seus ajustes ficam salvos por aba.</Text>
             <View style={[styles.mappingRow, width < 550 && styles.mappingRowMobile]}>
-              <View style={styles.mappingField}><Text style={styles.miniLabel}>CÓDIGO</Text><View style={[styles.pickerWrap, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant }]}><Picker selectedValue={codeColumn} onValueChange={setCodeColumn} style={styles.picker}>{workbookPreview.columns.map(c => <Picker.Item key={c.index} label={`${c.index}. ${c.label}`} value={c.index} />)}</Picker></View></View>
-              <View style={styles.mappingField}><Text style={styles.miniLabel}>NOME / DESCRIÇÃO</Text><View style={[styles.pickerWrap, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant }]}><Picker selectedValue={nameColumn} onValueChange={setNameColumn} style={styles.picker}>{workbookPreview.columns.map(c => <Picker.Item key={c.index} label={`${c.index}. ${c.label}`} value={c.index} />)}</Picker></View></View>
-              <View style={styles.mappingField}><Text style={styles.miniLabel}>QUANTIDADE</Text><View style={[styles.pickerWrap, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant }]}><Picker selectedValue={quantityColumn} onValueChange={setQuantityColumn} style={styles.picker}><Picker.Item label="Não importar" value={0} />{workbookPreview.columns.map(c => <Picker.Item key={c.index} label={`${c.index}. ${c.label}`} value={c.index} />)}</Picker></View></View>
+              <View style={styles.mappingField}><Text style={styles.miniLabel}>CÓDIGO</Text><View style={[styles.pickerWrap, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant }]}><Picker selectedValue={codeColumn} onValueChange={(value) => changeStockColumn('codeColumn', Number(value))} style={styles.picker}>{workbookPreview.columns.map(c => <Picker.Item key={c.index} label={`${c.index}. ${c.label}`} value={c.index} />)}</Picker></View></View>
+              <View style={styles.mappingField}><Text style={styles.miniLabel}>NOME / DESCRIÇÃO</Text><View style={[styles.pickerWrap, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant }]}><Picker selectedValue={nameColumn} onValueChange={(value) => changeStockColumn('nameColumn', Number(value))} style={styles.picker}>{workbookPreview.columns.map(c => <Picker.Item key={c.index} label={`${c.index}. ${c.label}`} value={c.index} />)}</Picker></View></View>
+              <View style={styles.mappingField}><Text style={styles.miniLabel}>QUANTIDADE</Text><View style={[styles.pickerWrap, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant }]}><Picker selectedValue={quantityColumn} onValueChange={(value) => changeStockColumn('quantityColumn', Number(value))} style={styles.picker}><Picker.Item label="Não importar" value={0} />{workbookPreview.columns.map(c => <Picker.Item key={c.index} label={`${c.index}. ${c.label}`} value={c.index} />)}</Picker></View></View>
             </View>
             <View style={[styles.previewTable, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]}>
               <Text style={styles.miniLabel}>AMOSTRA DOS DADOS</Text>
@@ -836,31 +957,65 @@ function AppScreen() {
       {workflowStep === 'items' && <Card style={[styles.materialCard, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]}>
         <SectionTitle eyebrow="PASSO 2 DE 3" title="Quais plaquetas você precisa?" subtitle="Digite ou cole uma lista. O app procura os códigos e nomes na base salva no celular." accent={theme.primary} />
         <View style={[styles.segmented, { backgroundColor: theme.surfaceContainer }]}>
-          <Pressable onPress={() => { setInputMode('code'); lastPickedSuggestionRef.current = ''; setSuggestions([]); }} style={[styles.segment, inputMode === 'code' && { backgroundColor: theme.surface, borderRadius: 12 }]}><Text style={[styles.segmentText, inputMode === 'code' && { color: theme.primary }]}>Por código</Text></Pressable>
-          <Pressable onPress={() => { setInputMode('name'); lastPickedSuggestionRef.current = ''; setSuggestions([]); }} style={[styles.segment, inputMode === 'name' && { backgroundColor: theme.surface, borderRadius: 12 }]}><Text style={[styles.segmentText, inputMode === 'name' && { color: theme.primary }]}>Por nome</Text></Pressable>
+          <Pressable onPress={() => { setInputMode('code'); setQuickSearchQuery(''); setQuickSelectedItem(null); setQuickSuggestions([]); }} style={[styles.segment, inputMode === 'code' && { backgroundColor: theme.surface, borderRadius: 12 }]}><Text style={[styles.segmentText, inputMode === 'code' && { color: theme.primary }]}>Por código</Text></Pressable>
+          <Pressable onPress={() => { setInputMode('name'); setQuickSearchQuery(''); setQuickSelectedItem(null); setQuickSuggestions([]); }} style={[styles.segment, inputMode === 'name' && { backgroundColor: theme.surface, borderRadius: 12 }]}><Text style={[styles.segmentText, inputMode === 'name' && { color: theme.primary }]}>Por nome</Text></Pressable>
         </View>
-        <TextInput value={inputText} onChangeText={handleInputTextChange} multiline textAlignVertical="top" placeholder={inputMode === 'code' ? 'Cole os códigos aqui, um por linha…\nEx.: 76120200487\n76150100651' : 'Digite parte do nome do material…'} style={[styles.textInput, styles.listInput, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant, minHeight: 126, borderRadius: 16 }]} />
-        {suggestions.length > 0 && <View style={[styles.suggestionPanel, { borderColor: theme.surfaceVariant, backgroundColor: theme.surface }]}>
-          <Text style={[styles.catalogSectionCaption, { color: theme.primary }]}>SUGESTÕES {inputMode === 'code' ? 'POR CÓDIGO' : 'POR NOME'}</Text>
-          {suggestions.slice(0, 8).map((item, i) => <Pressable key={`${item.code}-${i}`} onPress={() => chooseSuggestion(item)} style={styles.suggestionRow}>
-            <View style={{ flex: 1 }}><Text style={styles.suggestionName}>{item.name}</Text><Text style={styles.helper}>Código: {item.code}</Text></View><Ionicons name="arrow-down-circle-outline" size={21} color={theme.primary} />
+        <Text style={styles.fieldLabel}>Buscar um produto com preenchimento automático</Text>
+        <View style={[styles.catalogSearchWrap, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant }]}>
+          <Ionicons name={inputMode === 'code' ? 'barcode-outline' : 'search-outline'} size={19} color={theme.outline} />
+          <TextInput
+            value={quickSearchQuery}
+            onChangeText={value => { setQuickSearchQuery(value); setQuickSelectedItem(null); }}
+            placeholder={inputMode === 'code' ? 'Digite o começo do código…' : 'Digite o começo do nome do produto…'}
+            placeholderTextColor={theme.outline}
+            autoCapitalize="none"
+            autoCorrect={false}
+            returnKeyType="search"
+            style={styles.catalogSearchInput}
+          />
+          {!!quickSearchQuery && <Pressable onPress={() => { setQuickSearchQuery(''); setQuickSelectedItem(null); setQuickSuggestions([]); }} hitSlop={8}><Ionicons name="close-circle" size={18} color={theme.outline} /></Pressable>}
+        </View>
+        {quickSearchLoading && <View style={styles.quickSearchStatus}><ActivityIndicator size="small" color={theme.primary} /><Text style={styles.helper}>Procurando na planilha de estoque…</Text></View>}
+        {quickSuggestions.length > 0 && <View style={[styles.suggestionPanel, { borderColor: theme.surfaceVariant, backgroundColor: theme.surface }]}> 
+          <Text style={[styles.catalogSectionCaption, { color: theme.primary }]}>SUGESTÕES DO ESTOQUE · TOQUE PARA PREENCHER</Text>
+          {quickSuggestions.map((item, i) => <Pressable key={`${item.code}-${item.name}-${i}`} onPress={() => { setQuickSelectedItem(item); setQuickSearchQuery(inputMode === 'code' ? item.code : item.name); setQuickSuggestions([]); }} accessibilityRole="button" accessibilityLabel={`Selecionar ${item.name}, código ${item.code}`} style={styles.suggestionRow}>
+            <View style={{ flex: 1 }}><Text style={styles.suggestionName}>{item.name}</Text><Text style={styles.helper}>Código: {item.code}{item.quantity ? ` · Quantidade: ${item.quantity}` : ''}</Text></View><View style={{ flexDirection: 'row', alignItems: 'center', gap: 5 }}><Text style={{ color: theme.primary, fontSize: 10, fontWeight: '900' }}>SELECIONAR</Text><Ionicons name="chevron-forward-circle" size={21} color={theme.primary} /></View>
           </Pressable>)}
         </View>}
-        <ActionButton title="Adicionar à lista" onPress={addItems} icon="add" primaryColor={theme.primary} disabled={!!busy || !localReady} />
+        {quickSearchQuery.trim().length > 0 && !quickSearchLoading && quickSuggestions.length === 0 && !quickSelectedItem && <Text style={styles.helper}>Nenhuma sugestão encontrada. Confira o texto ou use a lista manual abaixo.</Text>}
+        {quickSelectedItem && <View style={[styles.quickSelectedCard, { backgroundColor: theme.primaryContainer, borderColor: theme.primary }]}>
+          <View style={{ flex: 1, gap: 3 }}><Text style={[styles.suggestionName, { color: theme.onPrimaryContainer }]}>{quickSelectedItem.name}</Text><Text style={[styles.helper, { color: theme.onPrimaryContainer }]}>Código: {quickSelectedItem.code}{quickSelectedItem.quantity ? ` · Quantidade: ${quickSelectedItem.quantity}` : ''}</Text></View>
+          <Ionicons name="checkmark-circle" size={23} color={theme.primary} />
+        </View>}
+        <ActionButton title="Adicionar produto selecionado" onPress={() => {
+          if (!quickSelectedItem) return showMessage('Escolha uma sugestão do estoque antes de adicionar.');
+          const next: LabelItem = { ...quickSelectedItem, localId: makeId() };
+          setLabels(previous => [...previous, next]);
+          setActiveLabelIndex(labels.length);
+          setQuickSearchQuery('');
+          setQuickSelectedItem(null);
+          setQuickSuggestions([]);
+          showMessage(`${quickSelectedItem.name} adicionado à lista de plaquetas.`);
+        }} icon="add-circle-outline" primaryColor={theme.primary} disabled={!!busy || !quickSelectedItem} />
+
+        <Text style={styles.fieldLabel}>Ou adicione vários produtos de uma vez</Text>
+        <TextInput value={inputText} onChangeText={handleInputTextChange} multiline textAlignVertical="top" placeholder={inputMode === 'code' ? 'Cole vários códigos, separados por linha, vírgula ou ponto e vírgula…' : 'Cole vários nomes, separados por linha, vírgula ou ponto e vírgula…'} style={[styles.textInput, styles.listInput, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant, minHeight: 96, borderRadius: 16 }]} />
+        <ActionButton title="Adicionar lista digitada" onPress={addItems} icon="list-outline" primaryColor={theme.primary} disabled={!!busy || !localReady || !inputText.trim()} />
 
         <View style={[styles.catalogBrowser, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]}>
           <View style={styles.catalogBrowserHeader}>
             <View style={{ flex: 1, gap: 3 }}>
-              <Text style={[styles.catalogBrowserTitle, { color: theme.onPrimaryContainer }]}>Escolher direto da planilha</Text>
-              <Text style={styles.helper}>{catalogCount.toLocaleString('pt-BR')} produtos na base · marque os que deseja gerar</Text>
+              <Text style={[styles.catalogBrowserTitle, { color: theme.onPrimaryContainer }]}>Todos os produtos do estoque</Text>
+              <Text style={styles.helper}>O filtro pesquisa o estoque inteiro, não apenas os itens já selecionados.</Text>
             </View>
             <View style={[styles.catalogCountPill, { backgroundColor: theme.primaryContainer }]}><Text style={[styles.catalogCountPillText, { color: theme.primary }]}>{selectedCatalogRows.length} selecionado(s)</Text></View>
           </View>
           <View style={[styles.catalogSearchWrap, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant }]}>
             <Ionicons name="search-outline" size={19} color={theme.outline} />
-            <TextInput value={catalogSearch} onChangeText={updateCatalogSearch} placeholder="Filtrar produtos pelo nome…" placeholderTextColor={theme.outline} returnKeyType="search" style={styles.catalogSearchInput} />
+            <TextInput value={catalogSearch} onChangeText={updateCatalogSearch} placeholder="Filtrar produtos da planilha de estoque…" placeholderTextColor={theme.outline} returnKeyType="search" style={styles.catalogSearchInput} />
             {!!catalogSearch && <Pressable onPress={() => updateCatalogSearch('')} hitSlop={8}><Ionicons name="close-circle" size={18} color={theme.outline} /></Pressable>}
           </View>
+          <Text style={[styles.helper, { color: theme.primary, fontWeight: '800' }]}>{catalogSearch ? `${catalogFilteredCount.toLocaleString('pt-BR')} resultado(s) encontrados no estoque importado` : `${catalogFilteredCount.toLocaleString('pt-BR')} produtos disponíveis no estoque importado`}</Text>
           {catalogRowsLoading && catalogRows.length === 0 ? <View style={styles.catalogLoading}><ActivityIndicator color={theme.primary} /><Text style={styles.helper}>Pesquisando no estoque…</Text></View> : catalogRows.length === 0 ? <View style={styles.catalogEmpty}><Ionicons name="search-outline" size={25} color={theme.outline} /><Text style={styles.helper}>{database.ready ? 'Nenhum produto encontrado com esse nome.' : 'Importe uma planilha para visualizar os produtos aqui.'}</Text></View> : <View style={styles.catalogRows}>
             {catalogRows.map((item, index) => {
               const checked = selectedCatalogRows.some(row => catalogSelectionKey(row) === catalogSelectionKey(item));
@@ -1055,7 +1210,7 @@ const styles = StyleSheet.create({
   mappingBlock: { gap: 10 }, fieldLabel: { color: INK, fontWeight: '800', fontSize: 11, marginTop: 2 }, miniLabel: { color: MUTED, fontWeight: '900', fontSize: 8, letterSpacing: 1.1, marginBottom: 4 }, pickerWrap: { borderWidth: 1, borderColor: LINE, backgroundColor: '#FAFCFA', borderRadius: 9, overflow: 'hidden', minHeight: 39, justifyContent: 'center' }, picker: { minHeight: 38, width: '100%', color: INK, fontSize: 11 }, mappingRow: { flexDirection: 'row', gap: 8 }, mappingRowMobile: { flexDirection: 'column' }, mappingField: { flex: 1, minWidth: 0, gap: 4 },
   previewTable: { borderWidth: 1, borderColor: LINE, borderRadius: 9, padding: 8, gap: 5, overflow: 'hidden' }, tableRow: { flexDirection: 'row', borderBottomWidth: 1, borderColor: '#EDF1EE' }, tableHead: { width: 112, color: GREEN, fontWeight: '900', fontSize: 9, padding: 5, backgroundColor: '#F2F7F3' }, tableCell: { width: 112, color: INK, fontSize: 9, padding: 5 },
   sizeChoices: { flexDirection: 'row', gap: 8 }, sizeChoice: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 7, borderWidth: 1, borderColor: LINE, borderRadius: 11, padding: 10, backgroundColor: '#FFFFFF' }, sizeChoiceActive: { backgroundColor: '#F0F7F2', borderColor: '#A9CBB5' }, sizeChoiceTitle: { color: INK, fontSize: 11, fontWeight: '800' }, sizeChoiceTitleActive: { color: GREEN }, sizeChoiceMeta: { color: MUTED, fontSize: 9, marginTop: 2 }, warningText: { color: '#9B6020', fontSize: 10, lineHeight: 15, backgroundColor: '#FFF7EA', padding: 8, borderRadius: 7 }, advancedMap: { gap: 7, borderTopWidth: 1, borderColor: LINE, paddingTop: 12 }, shapeList: { maxHeight: 170, borderWidth: 1, borderColor: LINE, borderRadius: 9, overflow: 'hidden' }, shapeRow: { flexDirection: 'row', alignItems: 'center', padding: 7, gap: 5, borderBottomWidth: 1, borderBottomColor: LINE }, shapeName: { color: INK, fontSize: 9, fontWeight: '800' }, shapeAssign: { borderRadius: 6, backgroundColor: '#EFF6F1', paddingHorizontal: 7, paddingVertical: 6 }, shapeAssignText: { color: GREEN, fontSize: 8, fontWeight: '900' },
-  segmented: { flexDirection: 'row', backgroundColor: '#F1F5F2', borderRadius: 10, padding: 3, alignSelf: 'flex-start' }, segment: { paddingHorizontal: 17, paddingVertical: 8, borderRadius: 8 }, segmentActive: { backgroundColor: '#FFFFFF', shadowColor: '#000000', shadowOpacity: 0.06, shadowRadius: 3, elevation: 1 }, segmentText: { fontSize: 11, color: MUTED, fontWeight: '800' }, segmentTextActive: { color: GREEN }, textInput: { minHeight: 40, borderWidth: 1, borderColor: LINE, borderRadius: 9, paddingHorizontal: 11, paddingVertical: 9, color: INK, backgroundColor: '#FFFFFF', fontSize: 12 }, listInput: { minHeight: 112, textAlignVertical: 'top', lineHeight: 20 }, rowActions: { flexDirection: 'row', alignItems: 'center', gap: 9, flexWrap: 'wrap' }, suggestionPanel: { borderWidth: 1, borderColor: '#D9E9DE', borderRadius: 12, overflow: 'hidden', backgroundColor: '#FBFDFC' }, catalogSectionCaption: { fontSize: 9, fontWeight: '900', letterSpacing: 1.1, paddingHorizontal: 11, paddingTop: 10, paddingBottom: 5 }, suggestionRow: { flexDirection: 'row', alignItems: 'center', padding: 10, borderBottomWidth: 1, borderBottomColor: LINE, gap: 8 }, suggestionName: { color: INK, fontSize: 12, fontWeight: '800' }, catalogBrowser: { borderWidth: 1, borderRadius: 18, padding: 12, gap: 11 }, catalogBrowserHeader: { flexDirection: 'row', alignItems: 'center', gap: 8 }, catalogBrowserTitle: { fontSize: 15, fontWeight: '900' }, catalogCountPill: { borderRadius: 20, paddingHorizontal: 9, paddingVertical: 7 }, catalogCountPillText: { fontSize: 9, fontWeight: '900' }, catalogSearchWrap: { minHeight: 46, borderWidth: 1, borderRadius: 13, paddingHorizontal: 11, flexDirection: 'row', alignItems: 'center', gap: 8 }, catalogSearchInput: { flex: 1, minWidth: 0, paddingVertical: 9, color: INK, fontSize: 12 }, catalogLoading: { minHeight: 90, alignItems: 'center', justifyContent: 'center', gap: 8 }, catalogEmpty: { minHeight: 92, alignItems: 'center', justifyContent: 'center', gap: 7 }, catalogRows: { borderWidth: 1, borderColor: LINE, borderRadius: 13, overflow: 'hidden' }, catalogProductRow: { minHeight: 62, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 11, paddingVertical: 9, gap: 10, borderBottomWidth: 1 }, catalogProductText: { flex: 1, minWidth: 0, gap: 3 }, catalogProductName: { fontSize: 12, fontWeight: '800' }, catalogProductCode: { fontSize: 10, fontWeight: '700' }, catalogMoreButton: { minHeight: 39, borderWidth: 1, borderRadius: 12, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 7 }, catalogMoreText: { fontSize: 11, fontWeight: '800' },
+  segmented: { flexDirection: 'row', backgroundColor: '#F1F5F2', borderRadius: 10, padding: 3, alignSelf: 'flex-start' }, segment: { paddingHorizontal: 17, paddingVertical: 8, borderRadius: 8 }, segmentActive: { backgroundColor: '#FFFFFF', shadowColor: '#000000', shadowOpacity: 0.06, shadowRadius: 3, elevation: 1 }, segmentText: { fontSize: 11, color: MUTED, fontWeight: '800' }, segmentTextActive: { color: GREEN }, textInput: { minHeight: 40, borderWidth: 1, borderColor: LINE, borderRadius: 9, paddingHorizontal: 11, paddingVertical: 9, color: INK, backgroundColor: '#FFFFFF', fontSize: 12 }, listInput: { minHeight: 112, textAlignVertical: 'top', lineHeight: 20 }, rowActions: { flexDirection: 'row', alignItems: 'center', gap: 9, flexWrap: 'wrap' }, quickSearchStatus: { minHeight: 30, flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 4 }, quickSelectedCard: { borderWidth: 1, borderRadius: 13, padding: 11, flexDirection: 'row', alignItems: 'center', gap: 10 }, suggestionPanel: { borderWidth: 1, borderColor: '#D9E9DE', borderRadius: 12, overflow: 'hidden', backgroundColor: '#FBFDFC' }, catalogSectionCaption: { fontSize: 9, fontWeight: '900', letterSpacing: 1.1, paddingHorizontal: 11, paddingTop: 10, paddingBottom: 5 }, suggestionRow: { flexDirection: 'row', alignItems: 'center', padding: 10, borderBottomWidth: 1, borderBottomColor: LINE, gap: 8 }, suggestionName: { color: INK, fontSize: 12, fontWeight: '800' }, catalogBrowser: { borderWidth: 1, borderRadius: 18, padding: 12, gap: 11 }, catalogBrowserHeader: { flexDirection: 'row', alignItems: 'center', gap: 8 }, catalogBrowserTitle: { fontSize: 15, fontWeight: '900' }, catalogCountPill: { borderRadius: 20, paddingHorizontal: 9, paddingVertical: 7 }, catalogCountPillText: { fontSize: 9, fontWeight: '900' }, catalogSearchWrap: { minHeight: 46, borderWidth: 1, borderRadius: 13, paddingHorizontal: 11, flexDirection: 'row', alignItems: 'center', gap: 8 }, catalogSearchInput: { flex: 1, minWidth: 0, paddingVertical: 9, color: INK, fontSize: 12 }, catalogLoading: { minHeight: 90, alignItems: 'center', justifyContent: 'center', gap: 8 }, catalogEmpty: { minHeight: 92, alignItems: 'center', justifyContent: 'center', gap: 7 }, catalogRows: { borderWidth: 1, borderColor: LINE, borderRadius: 13, overflow: 'hidden' }, catalogProductRow: { minHeight: 62, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 11, paddingVertical: 9, gap: 10, borderBottomWidth: 1 }, catalogProductText: { flex: 1, minWidth: 0, gap: 3 }, catalogProductName: { fontSize: 12, fontWeight: '800' }, catalogProductCode: { fontSize: 10, fontWeight: '700' }, catalogMoreButton: { minHeight: 39, borderWidth: 1, borderRadius: 12, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 7 }, catalogMoreText: { fontSize: 11, fontWeight: '800' },
   previewControls: { flexDirection: 'row', alignSelf: 'flex-start', padding: 3, borderRadius: 8, backgroundColor: '#F0F4F1', gap: 3 }, previewToggle: { paddingHorizontal: 13, paddingVertical: 7, borderRadius: 6 }, previewToggleActive: { backgroundColor: '#FFFFFF' }, previewToggleText: { color: MUTED, fontSize: 10, fontWeight: '700' }, previewToggleTextActive: { color: GREEN }, labelStage: { backgroundColor: '#F6F8F6', padding: 12, borderRadius: 12, alignItems: 'center', gap: 8 }, labelPreview: { width: '100%', maxWidth: 400, minHeight: 225, backgroundColor: '#FFFFFF', borderWidth: 2, borderColor: '#111111' }, labelPreviewCompact: { maxWidth: 310, minHeight: 190 }, labelTop: { height: 54, flexDirection: 'row', borderBottomWidth: 2, borderColor: '#111111' }, logoCell: { width: '29%', borderRightWidth: 2, borderColor: '#111111', justifyContent: 'center', alignItems: 'center' }, logoText: { fontSize: 21, fontWeight: '900', letterSpacing: -1.7, color: '#1E2421' }, logoSub: { fontSize: 6, color: '#1E2421', fontWeight: '900', letterSpacing: 1 }, codeCell: { flex: 1, paddingHorizontal: 8, paddingVertical: 4, justifyContent: 'space-between' }, labelSmall: { fontSize: 9, color: '#111111', fontWeight: '800' }, labelCode: { textAlign: 'center', fontSize: 19, fontWeight: '900', color: '#111111', marginBottom: 2 }, itemCell: { flex: 1, paddingHorizontal: 7, paddingTop: 5, paddingBottom: 7, borderBottomWidth: 2, borderColor: '#111111', justifyContent: 'space-between' }, labelName: { fontSize: 17, lineHeight: 23, color: '#111111', fontWeight: '900', textAlign: 'center', marginHorizontal: 7, marginVertical: 8 }, labelBottom: { minHeight: 60, flexDirection: 'row' }, bottomCell: { flex: 1, padding: 4 }, labelNav: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 16 }, navCircle: { width: 30, height: 30, borderRadius: 15, backgroundColor: '#F1F5F2', alignItems: 'center', justifyContent: 'center' }, navCount: { color: INK, fontSize: 11, fontWeight: '800' },
   emptyState: { alignItems: 'center', paddingVertical: 22, gap: 6 }, emptyTitle: { color: INK, fontSize: 12, fontWeight: '800' }, itemList: { gap: 10 }, itemEditor: { borderWidth: 1, borderColor: LINE, borderRadius: 11, padding: 10, gap: 5, backgroundColor: '#FCFDFC' }, itemEditorTop: { flexDirection: 'row', alignItems: 'center', gap: 9, marginBottom: 3 }, itemNumber: { color: GREEN, fontSize: 10, fontWeight: '900' }, itemStock: { flex: 1, color: MUTED, fontSize: 9 }, editInput: { minHeight: 34, paddingHorizontal: 9, paddingVertical: 6, borderWidth: 1, borderColor: LINE, borderRadius: 7, color: INK, fontSize: 11, backgroundColor: '#FFFFFF' }, showPreviewLink: { flexDirection: 'row', alignItems: 'center', gap: 5, alignSelf: 'flex-start', paddingTop: 3 }, showPreviewText: { color: GREEN, fontSize: 9, fontWeight: '800' }, exportBox: { borderTopWidth: 1, borderColor: LINE, paddingTop: 13, marginTop: 2, gap: 10 }, exportTitle: { color: INK, fontSize: 13, fontWeight: '900' }, exportRow: { flexDirection: 'row', alignItems: 'center', gap: 12 }, pageInputWrap: { width: 78 }, pageInput: { borderWidth: 1, borderColor: LINE, borderRadius: 8, padding: 7, color: INK, fontWeight: '800', textAlign: 'center', minHeight: 34 }, exportButtons: { flexDirection: 'row', gap: 8 }, successText: { color: GREEN, fontSize: 9, fontWeight: '700' },
   footer: { alignItems: 'center', gap: 5, paddingTop: 12 }, footerText: { color: '#9BA79F', fontSize: 8, letterSpacing: 0.5 }, busyOverlay: { position: 'absolute', top: 0, bottom: 0, left: 0, right: 0, backgroundColor: 'rgba(244,247,244,0.55)', justifyContent: 'center', alignItems: 'center' }, busyCard: { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: '#FFFFFF', paddingHorizontal: 16, paddingVertical: 13, borderRadius: 12, borderWidth: 1, borderColor: LINE, elevation: 5 }, busyText: { color: INK, fontSize: 11, fontWeight: '800' },

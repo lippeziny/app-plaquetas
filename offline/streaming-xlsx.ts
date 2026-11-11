@@ -1,6 +1,7 @@
 import { File as ExpoFile } from 'expo-file-system';
 import * as FileSystem from 'expo-file-system/legacy';
 import { Utf8StreamDecoder } from './utf8-stream';
+import { detectStockColumnMapping, type StockColumnMapping } from './stock-detection';
 import {
   clearImportStaging,
   finalizeStagedCatalog,
@@ -38,7 +39,7 @@ export type StreamingWorkbookPreview = {
   headers: string[];
   rows: string[][];
   columns: { index: number; label: string }[];
-  suggested: { codeColumn: number; nameColumn: number; quantityColumn: number };
+  suggested: StockColumnMapping;
 };
 export type ImportProgress = {
   stage: string;
@@ -174,7 +175,7 @@ export async function previewXlsxSheet(
   // Some workbooks use inline strings and can skip that potentially huge entry entirely.
   const wanted = [sheetPath, source.stylesPath || ''];
   await extractEntries(source, wanted, progress => onProgress?.({ stage: 'Preparando prévia da aba', percent: 0.14 + progress * 0.06 }), signal);
-  const parsedRows = await readPreviewRows(xmlChunks(joinUri(source.directory, sheetPath), signal), 6, () => !!signal?.aborted);
+  const parsedRows = await readPreviewRows(xmlChunks(joinUri(source.directory, sheetPath), signal), 30, () => !!signal?.aborted);
   let shared = new Map<number, string>();
   if (source.sharedStringsPath && parsedRows.sharedIds.size) {
     await extractEntries(source, [source.sharedStringsPath], progress => onProgress?.({ stage: 'Preparando os nomes da prévia', percent: 0.20 + progress * 0.01 }), signal);
@@ -184,19 +185,20 @@ export async function previewXlsxSheet(
     ? parseStylesXml(await new ExpoFile(joinUri(source.directory, source.stylesPath)).text())
     : [];
   const rows = resolvePreviewRows(parsedRows, shared, Math.max(4, Math.min(parsedRows.maxColumn || 4, 32)), styleFormats);
-  const headers = (rows[0] || []).map((cell, index) => cell || `Coluna ${index + 1}`);
-  const sample = rows.slice(1, 6);
+  const rowNumbers = parsedRows.rows.map(row => row.rowNumber);
+  const detected = detectStockColumnMapping(rows, rowNumbers);
+  const headerIndex = Math.max(0, rowNumbers.findIndex(rowNumber => rowNumber === detected.headerRow));
+  const headerValues = rows[headerIndex] || rows[0] || [];
+  const headers = headerValues.map((cell, index) => cell || `Coluna ${index + 1}`);
+  const sample = rows.slice(headerIndex + 1, headerIndex + 6);
   const columns = headers.map((label, index) => ({ index: index + 1, label }));
-  return {
-    headers, rows: sample, columns,
-    suggested: { codeColumn: 1, nameColumn: 2, quantityColumn: 4 },
-  };
+  return { headers, rows: sample, columns, suggested: detected };
 }
 
 export async function importXlsxSheetToCatalog(
   source: WorkbookFileSource,
   sheetName: string,
-  mapping: { codeColumn: number; nameColumn: number; quantityColumn: number },
+  mapping: { codeColumn: number; nameColumn: number; quantityColumn: number; headerRow?: number },
   onProgress: (progress: ImportProgress) => void,
   signal?: AbortSignal,
 ): Promise<{ total: number; skipped: number; sourceRows: number }> {
@@ -227,12 +229,12 @@ export async function importXlsxSheetToCatalog(
         lastReport = now;
         const fraction = sheetSize
           ? Math.min(1, actualSheetBytesRead / sheetSize)
-          : (progress.totalRows ? Math.min(1, progress.rowsRead / Math.max(1, progress.totalRows - 1)) : 0);
+          : (progress.totalRows ? Math.min(1, progress.rowsRead / Math.max(1, progress.totalRows - (mapping.headerRow || 1))) : 0);
         onProgress({
           stage: 'Extraindo código, descrição e quantidade',
           percent: 0.16 + fraction * 0.52,
           rowsProcessed: progress.rowsRead,
-          totalRows: progress.totalRows ? Math.max(0, progress.totalRows - 1) : undefined,
+          totalRows: progress.totalRows ? Math.max(0, progress.totalRows - (mapping.headerRow || 1)) : undefined,
           bytesProcessed: actualSheetBytesRead,
           totalBytes: sheetSize,
         });

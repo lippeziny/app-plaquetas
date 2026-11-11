@@ -4,6 +4,7 @@ import type { CatalogItem } from './workbook';
 import type { SlidePositionSettings } from './pptx';
 
 export type LocalDatabaseInfo = { total: number; sheetName: string; sourceFile: string; ready: boolean };
+export type StoredStockColumnMapping = { codeColumn: number; nameColumn: number; quantityColumn: number; headerRow: number };
 export type StoredAppData = {
   catalog: CatalogItem[];
   database: LocalDatabaseInfo;
@@ -13,6 +14,11 @@ export type StoredAppData = {
   templateName?: string;
   templateAdjustments?: Record<string, SlidePositionSettings>;
   themeId?: string;
+  /** Persistent copy of the user's source XLSX, kept in the app's private documents directory. */
+  stockWorkbookUri?: string;
+  stockWorkbookName?: string;
+  selectedSheetName?: string;
+  stockColumnMappings?: Record<string, StoredStockColumnMapping>;
 };
 
 export const EMPTY_LOCAL_DATA: StoredAppData = {
@@ -49,6 +55,7 @@ export async function readLocalData(): Promise<StoredAppData> {
       database: parsed.database || EMPTY_LOCAL_DATA.database,
       templateAdjustments: parsed.templateAdjustments && typeof parsed.templateAdjustments === 'object' ? parsed.templateAdjustments : {},
       themeId: typeof parsed.themeId === 'string' ? parsed.themeId : 'azul',
+      stockColumnMappings: parsed.stockColumnMappings && typeof parsed.stockColumnMappings === 'object' ? parsed.stockColumnMappings : {},
     };
   } catch (error) {
     console.warn('Não foi possível carregar os dados locais do Plaquetas:', error);

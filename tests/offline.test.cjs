@@ -29,6 +29,7 @@ const workbookTools = loadTypeScriptModule('../offline/workbook.ts');
 const pdfTools = loadTypeScriptModule('../offline/pdf.ts');
 const xlsxXmlTools = loadTypeScriptModule('../offline/xlsx-xml.ts');
 const utf8Tools = loadTypeScriptModule('../offline/utf8-stream.ts');
+const stockDetectionTools = loadTypeScriptModule('../offline/stock-detection.ts');
 const templatePath = path.resolve(__dirname, '..', 'assets', 'default-template.pptx');
 
 test('inspects the bundled template locally and finds both 8-label layouts', async () => {
@@ -146,6 +147,29 @@ test('streams XLSX workbook metadata and resolves worksheet relationship paths',
   assert.equal(xlsxXmlTools.resolveWorksheetPath(`xl/${relationships.rId1}`), 'xl/worksheets/sheet1.xml');
 });
 
+test('detects the default stock tab and columns by semantic header names', () => {
+  assert.equal(stockDetectionTools.chooseDefaultStockSheet(['Cadastro', 'Estoque SAP', 'Resumo']), 'Estoque SAP');
+  assert.equal(stockDetectionTools.chooseDefaultStockSheet(['Produtos', 'Inventário']), 'Produtos');
+  const detected = stockDetectionTools.detectStockColumnMapping([
+    ['Relatório do almoxarifado'],
+    ['Atualizado em 10/11/2026'],
+    ['Número do produto', 'Descrição do produto', 'Unidade', 'Quantidade em estoque'],
+    ['0012', 'CALÇA JEANS', 'UN', '25'],
+  ], [1, 2, 4, 5]);
+  assert.deepEqual(detected, { codeColumn: 1, nameColumn: 2, quantityColumn: 4, headerRow: 4 });
+  const alternate = stockDetectionTools.detectStockColumnMapping([
+    ['Código', 'Nome do item', 'Qtd.'],
+    ['0099', 'MOTOR', '14'],
+  ], [1, 2]);
+  assert.deepEqual(alternate, { codeColumn: 1, nameColumn: 2, quantityColumn: 3, headerRow: 1 });
+  const lateHeader = stockDetectionTools.detectStockColumnMapping([
+    ['Relatório'], ['Emitido em 10/11'], ['Empresa X'], ['Depósito central'], [''],
+    [''], [''], [''], [''], [''], ['Nº do material', 'Descrição', 'Unidade', 'Qtd. estoque'],
+    ['0007', 'CORREIA', 'UN', '12'],
+  ], Array.from({ length: 12 }, (_, index) => index + 1));
+  assert.deepEqual(lateHeader, { codeColumn: 1, nameColumn: 2, quantityColumn: 4, headerRow: 11 });
+});
+
 test('reads only selected XLSX columns A, B and D in bounded chunks', async () => {
   const xml = `<?xml version="1.0"?><worksheet><dimension ref="A1:D4"/><sheetData>
     <row r="1"><c r="A1" t="inlineStr"><is><t>Código</t></is></c><c r="B1" t="inlineStr"><is><t>Descrição</t></is></c><c r="D1" t="inlineStr"><is><t>Quantidade</t></is></c></row>
@@ -164,6 +188,27 @@ test('reads only selected XLSX columns A, B and D in bounded chunks', async () =
     [2, '0', '1', '17'], [3, '2', '3', '9'],
   ]);
   assert.ok(received.every(row => !Object.values(row).includes('IGNORAR')));
+});
+
+test('streaming importer skips title rows and the detected header row before saving stock items', async () => {
+  const xml = `<worksheet><dimension ref="A1:D5"/><sheetData>
+    <row r="1"><c r="A1" t="inlineStr"><is><t>RELATÓRIO</t></is></c></row>
+    <row r="2"><c r="A2" t="inlineStr"><is><t>Estoque geral</t></is></c></row>
+    <row r="3"><c r="A3" t="inlineStr"><is><t>Número</t></is></c><c r="B3" t="inlineStr"><is><t>Descrição</t></is></c><c r="D3" t="inlineStr"><is><t>Quantidade</t></is></c></row>
+    <row r="4"><c r="A4"><v>123</v></c><c r="B4" t="inlineStr"><is><t>CALÇA JEANS</t></is></c><c r="D4"><v>7</v></c></row>
+    <row r="5"><c r="A5"><v>124</v></c><c r="B5" t="inlineStr"><is><t>CAMISA</t></is></c><c r="D5"><v>3</v></c></row>
+  </sheetData></worksheet>`;
+  const received = [];
+  const result = await xlsxXmlTools.parseWorksheetToImportRows(
+    textChunks(xml, 37),
+    { codeColumn: 1, nameColumn: 2, quantityColumn: 4, headerRow: 3 },
+    async batch => received.push(...batch),
+  );
+  assert.equal(result.rowsRead, 2);
+  assert.deepEqual(received.map(row => [row.rowNumber, row.codeRaw, row.nameRaw, row.quantityRaw]), [
+    [4, '123', 'CALÇA JEANS', '7'],
+    [5, '124', 'CAMISA', '3'],
+  ]);
 });
 
 test('preserves Excel numeric formats for identifiers with leading zeroes', () => {
@@ -235,7 +280,7 @@ test('mobile app contains no backend API calls and blocks Android network permis
   assert.match(importer, /import \{ File as ExpoFile \} from 'expo-file-system';/, 'use the Expo SDK 54 File export');
   assert.match(importer, /const handle = file\.open\(\);/, 'SDK 54 File.open takes no mode argument');
   assert.doesNotMatch(importer, /FileMode|file\.open\(\s*[^)]/, 'do not use FileMode or pass arguments to File.open in the pinned SDK');
-  assert.match(importer, /suggested: \{ codeColumn: 1, nameColumn: 2, quantityColumn: 4 \}/, 'stock import defaults to A/B/D');
+  assert.match(importer, /detectStockColumnMapping/, 'stock columns must be detected by header names');
   assert.match(importer, /getNeededSharedStringIds/);
   const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
   assert.ok(pkg.dependencies['expo-sqlite']);
@@ -260,17 +305,33 @@ test('app exposes the real template preview, global/individual adjustments and M
 });
 
 
-test('catalog browser supports name filtering, paged results and code/name suggestions', () => {
+test('catalog browser filters the complete imported stock database, not the selected label list', () => {
   const catalogSource = fs.readFileSync(path.resolve(__dirname, '..', 'offline', 'catalog-db.ts'), 'utf8');
   const appSource = fs.readFileSync(path.resolve(__dirname, '..', 'App.tsx'), 'utf8');
   assert.match(catalogSource, /export async function searchCatalogSuggestions\([\s\S]*?field: 'code' \| 'name'/);
-  assert.match(catalogSource, /export async function getCatalogPage\(/);
+  assert.match(catalogSource, /export async function searchStockCatalogPage\(/);
+  assert.match(catalogSource, /export async function countStockCatalogMatches\(/);
   assert.match(catalogSource, /name_norm LIKE \?/);
-  assert.match(appSource, /searchCatalogSuggestions\(query, inputMode, 8\)/);
-  assert.match(appSource, /Filtrar produtos pelo nome/);
+  assert.match(appSource, /searchCatalogSuggestions\(query, inputMode, 10\)/);
+  assert.match(appSource, /quickSearchQuery/);
+  assert.match(appSource, /Buscar um produto com preenchimento automático/);
+  assert.match(appSource, /Adicionar produto selecionado/);
+  assert.match(appSource, /Ou adicione vários produtos de uma vez/);
+  assert.match(appSource, /setQuickSelectedItem\(item\)/);
+  assert.match(appSource, /searchStockCatalogPage\(catalogSearch, 60, 0\)/);
+  assert.match(appSource, /Busca pesquisa o estoque inteiro|filtro pesquisa o estoque inteiro/i);
   assert.match(appSource, /Adicionar \$\{selectedCatalogRows\.length\} selecionado/);
   assert.match(appSource, /accessibilityRole="checkbox"/);
   assert.match(appSource, /Carregar mais produtos/);
+  assert.match(catalogSource, /FROM catalog WHERE name_norm LIKE/);
+  assert.match(appSource, /stockWorkbookUri/);
+  assert.match(appSource, /chooseDefaultStockSheet/);
+  assert.match(appSource, /stockColumnMappings/);
+  assert.match(appSource, /selectedSheetName/);
+  assert.match(importer, /readPreviewRows\([\s\S]*?, 30,/);
+  assert.match(appSource, /stockColumnMappings/);
+  assert.match(appSource, /selectedSheetName/);
+  assert.match(appSource, /Restaurar a última planilha de estoque|Restore the last stock workbook/);
 });
 
 test('live PPTX preview crops embedded square logo artwork to the actual wide shape bounds', () => {

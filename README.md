@@ -97,3 +97,9 @@ A importação de modelos PowerPoint personalizados também lê o arquivo como b
 ### Build note for v4.3.1
 
 The streaming XLSX reader uses the Expo SDK 54 `File.open()` signature with no mode argument. It continues reading the extracted XML in 256 KB chunks using `FileHandle.readBytes(length)`.
+
+## Versão 4.5.0 — identificação automática da planilha de estoque
+
+Ao escolher um arquivo XLSX, o aplicativo prioriza a aba cujo nome contém "Estoque" (correspondência exata, depois prefixo, depois ocorrência parcial). A detecção lê até 30 linhas iniciais para identificar a linha de cabeçalho e os campos Número/Código, Descrição/Nome/Item e Quantidade/Qtd/Estoque/Saldo. Se os cabeçalhos forem atípicos, a seleção manual de colunas continua disponível. As escolhas de aba e mapeamento ficam salvas por arquivo/aba, e a cópia do XLSX permanece no armazenamento privado do aparelho para ser restaurada na próxima abertura.
+
+Na etapa Itens, a busca rápida individual agora é uma caixa de uma linha com sugestões por código ou nome, alimentadas pelo catálogo SQLite completo. Tocar numa sugestão confirma o produto e o botão “Adicionar produto selecionado” o inclui com código, descrição e quantidade. A área separada de colagem em lote continua disponível. O filtro do catálogo consulta o estoque importado completo, independentemente dos produtos já marcados para impressão.

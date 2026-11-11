@@ -141,23 +141,35 @@ export async function searchCatalogSuggestions(
 ): Promise<CatalogItem[]> {
   const normalized = normalize(query);
   if (!normalized) return [];
-  const target = field === 'code' ? 'code_norm' : 'name_norm';
   if (Platform.OS === 'web') {
-    return getWebCatalog()
-      .filter(item => normalize(item[field]).startsWith(normalized))
-      .sort((a, b) => normalize(a[field]).localeCompare(normalize(b[field])))
-      .slice(0, limit);
+    const items = getWebCatalog();
+    const target = field === 'code' ? 'code' : 'name';
+    const prefix = items.filter(item => normalize(item[target]).startsWith(normalized));
+    const remainder = field === 'name'
+      ? items.filter(item => normalize(item.name).includes(normalized) && !normalize(item.name).startsWith(normalized))
+      : [];
+    return [...prefix, ...remainder].slice(0, limit);
   }
   const db = await getDb();
-  return db.getAllAsync<CatalogRow>(
-    `SELECT code, name, quantity, sheet_name AS sheetName FROM catalog WHERE ${target} LIKE ? ORDER BY ${target}, id LIMIT ?`,
-    `${normalized}%`, limit,
+  const target = field === 'code' ? 'code_norm' : 'name_norm';
+  const escaped = normalized.replace(/[\\%_]/g, '\\$&');
+  const prefixRows = await db.getAllAsync<CatalogRow>(
+    `SELECT code, name, quantity, sheet_name AS sheetName FROM catalog WHERE ${target} LIKE ? ESCAPE '\\' ORDER BY ${target}, id LIMIT ?`,
+    `${escaped}%`, limit,
   );
+  if (field === 'code' || prefixRows.length >= limit) return prefixRows;
+  const containsRows = await db.getAllAsync<CatalogRow>(
+    `SELECT code, name, quantity, sheet_name AS sheetName FROM catalog
+     WHERE name_norm LIKE ? ESCAPE '\\' AND name_norm NOT LIKE ? ESCAPE '\\'
+     ORDER BY name_norm, id LIMIT ?`,
+    `%${escaped}%`, `${escaped}%`, limit - prefixRows.length,
+  );
+  return [...prefixRows, ...containsRows];
 }
 
 /** Loads a bounded page from the local catalog. Name filtering is accent-insensitive
  * and supports text anywhere in the product description (e.g. "calca"). */
-export async function getCatalogPage(
+export async function searchStockCatalogPage(
   query = '',
   limit = 60,
   offset = 0,
@@ -189,6 +201,28 @@ export async function getCatalogPage(
     'SELECT code, name, quantity, sheet_name AS sheetName FROM catalog ORDER BY name_norm, id LIMIT ? OFFSET ?',
     safeLimit, safeOffset,
   );
+}
+
+/** Backwards-compatible alias for older screens. The data source is always the full imported stock catalog. */
+export const getCatalogPage = searchStockCatalogPage;
+
+/** Counts matches against the complete imported stock catalog, never the label-selection array. */
+export async function countStockCatalogMatches(query = ''): Promise<number> {
+  const normalized = normalize(query);
+  if (Platform.OS === 'web') {
+    const items = getWebCatalog();
+    return normalized ? items.filter(item => normalize(item.name).includes(normalized)).length : items.length;
+  }
+  const db = await getDb();
+  if (!normalized) {
+    const row = await db.getFirstAsync<{ total: number }>('SELECT COUNT(*) AS total FROM catalog');
+    return Number(row?.total || 0);
+  }
+  const escaped = normalized.replace(/[\\%_]/g, '\\$&');
+  const row = await db.getFirstAsync<{ total: number }>(
+    `SELECT COUNT(*) AS total FROM catalog WHERE name_norm LIKE ? ESCAPE '\\'`, `%${escaped}%`,
+  );
+  return Number(row?.total || 0);
 }
 
 export async function searchCatalogNames(query: string, limit = 8): Promise<CatalogItem[]> {

@@ -71,3 +71,14 @@ O fluxo de importação do modelo personalizado ainda chamava a função removid
 - A seleção de produtos permanece entre alterações do filtro e pode ser adicionada em lote às plaquetas; ao importar uma nova base, as seleções antigas são limpas.
 - Ajustado o recorte das imagens na prévia conforme os metadados `a:srcRect` / `a:fillRect` do PowerPoint. O logotipo CKTR usa `cover` para respeitar o recorte horizontal original; imagens sem recorte continuam em `contain`.
 - Incluídos testes de regressão para busca por nome/código, catálogo paginado, seleção por checkbox e modo de encaixe da imagem.
+
+## v4.5.0 — detecção semântica de estoque, persistência e busca de produtos
+
+- A aba padrão é escolhida automaticamente pelo nome: primeiro correspondência exata com "Estoque", depois nome iniciado por "Estoque" e depois qualquer nome que contenha "Estoque"; sem correspondência, usa a primeira aba.
+- A prévia lê até 30 linhas físicas da aba para localizar cabeçalhos mesmo quando há títulos/linhas introdutórias antes da tabela.
+- O mapeamento é inferido pelos rótulos das colunas, procurando Número/Código, Descrição/Nome/Item e Quantidade/Qtd/Estoque/Saldo. Mantém fallback A/B/D quando a planilha não oferece cabeçalhos reconhecíveis. O usuário pode remapear e cada aba tem o seu mapeamento persistido.
+- A cópia original XLSX continua guardada na pasta privada do app. Na próxima abertura, o aplicativo reabre o mesmo arquivo, restaura a aba anteriormente escolhida e reaplica as colunas salvas.
+- A seleção rápida de um único produto foi separada do campo de colagem em lote: o usuário escolhe Por código ou Por nome, digita, recebe sugestões diretamente da tabela completa de estoque, toca em uma sugestão e confirma o produto antes de adicioná-lo. A colagem múltipla continua em um campo separado.
+- A busca do catálogo continua consultando a tabela SQLite completa `catalog`, sem ler a lista de plaquetas selecionadas. O filtro de nome é independente das seleções de checkbox.
+- Preservada a correção de recorte/escala do logotipo CKTR da versão 4.4.0.
+- A prévia de cabeçalhos foi ampliada para até 30 linhas físicas para localizar tabelas com cabeçalho abaixo de títulos de relatório.
