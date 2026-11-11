@@ -82,3 +82,10 @@ O fluxo de importação do modelo personalizado ainda chamava a função removid
 - A busca do catálogo continua consultando a tabela SQLite completa `catalog`, sem ler a lista de plaquetas selecionadas. O filtro de nome é independente das seleções de checkbox.
 - Preservada a correção de recorte/escala do logotipo CKTR da versão 4.4.0.
 - A prévia de cabeçalhos foi ampliada para até 30 linhas físicas para localizar tabelas com cabeçalho abaixo de títulos de relatório.
+
+
+## v4.5.1 — correção do teste do catálogo
+
+- Corrigido o teste `catalog browser filters the complete imported stock database`: ele usava a variável `importer` sem declará-la no próprio escopo do teste.
+- O teste agora lê explicitamente `offline/streaming-xlsx.ts` antes de validar a detecção de cabeçalhos e a prévia de até 30 linhas.
+- Nenhuma lógica de produção do app foi alterada nesta correção; o filtro do catálogo continua consultando a tabela `catalog` completa.

@@ -103,3 +103,8 @@ The streaming XLSX reader uses the Expo SDK 54 `File.open()` signature with no m
 Ao escolher um arquivo XLSX, o aplicativo prioriza a aba cujo nome contém "Estoque" (correspondência exata, depois prefixo, depois ocorrência parcial). A detecção lê até 30 linhas iniciais para identificar a linha de cabeçalho e os campos Número/Código, Descrição/Nome/Item e Quantidade/Qtd/Estoque/Saldo. Se os cabeçalhos forem atípicos, a seleção manual de colunas continua disponível. As escolhas de aba e mapeamento ficam salvas por arquivo/aba, e a cópia do XLSX permanece no armazenamento privado do aparelho para ser restaurada na próxima abertura.
 
 Na etapa Itens, a busca rápida individual agora é uma caixa de uma linha com sugestões por código ou nome, alimentadas pelo catálogo SQLite completo. Tocar numa sugestão confirma o produto e o botão “Adicionar produto selecionado” o inclui com código, descrição e quantidade. A área separada de colagem em lote continua disponível. O filtro do catálogo consulta o estoque importado completo, independentemente dos produtos já marcados para impressão.
+
+
+## v4.5.1 — correção de escopo no teste
+
+O teste de regressão do catálogo passou a declarar a fonte `offline/streaming-xlsx.ts` no próprio bloco de teste antes de verificar a leitura de prévia. A falha anterior era um `ReferenceError` no teste (`importer is not defined`), não uma falha da busca do catálogo nem do código do aplicativo.

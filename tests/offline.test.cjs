@@ -308,6 +308,7 @@ test('app exposes the real template preview, global/individual adjustments and M
 test('catalog browser filters the complete imported stock database, not the selected label list', () => {
   const catalogSource = fs.readFileSync(path.resolve(__dirname, '..', 'offline', 'catalog-db.ts'), 'utf8');
   const appSource = fs.readFileSync(path.resolve(__dirname, '..', 'App.tsx'), 'utf8');
+  const importer = fs.readFileSync(path.resolve(__dirname, '..', 'offline', 'streaming-xlsx.ts'), 'utf8');
   assert.match(catalogSource, /export async function searchCatalogSuggestions\([\s\S]*?field: 'code' \| 'name'/);
   assert.match(catalogSource, /export async function searchStockCatalogPage\(/);
   assert.match(catalogSource, /export async function countStockCatalogMatches\(/);

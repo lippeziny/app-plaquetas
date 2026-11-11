@@ -1,6 +1,6 @@
 {
   "name": "plaquetas-by-lippe",
-  "version": "4.5.0",
+  "version": "4.5.1",
   "private": true,
   "main": "node_modules/expo/AppEntry.js",
   "scripts": {
