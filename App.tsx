@@ -428,7 +428,7 @@ function AppScreen() {
       setQuickSearchLoading(true);
       searchCatalogSuggestions(query, inputMode, 10)
         .then(rows => { if (active) setQuickSuggestions(rows); })
-        .catch(() => { if (active) setQuickSuggestions([]); })
+        .catch((error: any) => { if (active) { setQuickSuggestions([]); showMessage(error?.message || 'Não foi possível pesquisar na base de estoque.'); } })
         .finally(() => { if (active) setQuickSearchLoading(false); });
     }, 110);
     return () => { active = false; clearTimeout(timer); };
@@ -966,7 +966,7 @@ function AppScreen() {
           <TextInput
             value={quickSearchQuery}
             onChangeText={value => { setQuickSearchQuery(value); setQuickSelectedItem(null); }}
-            placeholder={inputMode === 'code' ? 'Digite o começo do código…' : 'Digite o começo do nome do produto…'}
+            placeholder={inputMode === 'code' ? 'Digite parte do código…' : 'Digite parte do nome do produto…'}
             placeholderTextColor={theme.outline}
             autoCapitalize="none"
             autoCorrect={false}
@@ -1012,11 +1012,11 @@ function AppScreen() {
           </View>
           <View style={[styles.catalogSearchWrap, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant }]}>
             <Ionicons name="search-outline" size={19} color={theme.outline} />
-            <TextInput value={catalogSearch} onChangeText={updateCatalogSearch} placeholder="Filtrar produtos da planilha de estoque…" placeholderTextColor={theme.outline} returnKeyType="search" style={styles.catalogSearchInput} />
+            <TextInput value={catalogSearch} onChangeText={updateCatalogSearch} placeholder="Filtrar por nome ou código…" placeholderTextColor={theme.outline} returnKeyType="search" style={styles.catalogSearchInput} />
             {!!catalogSearch && <Pressable onPress={() => updateCatalogSearch('')} hitSlop={8}><Ionicons name="close-circle" size={18} color={theme.outline} /></Pressable>}
           </View>
           <Text style={[styles.helper, { color: theme.primary, fontWeight: '800' }]}>{catalogSearch ? `${catalogFilteredCount.toLocaleString('pt-BR')} resultado(s) encontrados no estoque importado` : `${catalogFilteredCount.toLocaleString('pt-BR')} produtos disponíveis no estoque importado`}</Text>
-          {catalogRowsLoading && catalogRows.length === 0 ? <View style={styles.catalogLoading}><ActivityIndicator color={theme.primary} /><Text style={styles.helper}>Pesquisando no estoque…</Text></View> : catalogRows.length === 0 ? <View style={styles.catalogEmpty}><Ionicons name="search-outline" size={25} color={theme.outline} /><Text style={styles.helper}>{database.ready ? 'Nenhum produto encontrado com esse nome.' : 'Importe uma planilha para visualizar os produtos aqui.'}</Text></View> : <View style={styles.catalogRows}>
+          {catalogRowsLoading && catalogRows.length === 0 ? <View style={styles.catalogLoading}><ActivityIndicator color={theme.primary} /><Text style={styles.helper}>Pesquisando no estoque…</Text></View> : catalogRows.length === 0 ? <View style={styles.catalogEmpty}><Ionicons name="search-outline" size={25} color={theme.outline} /><Text style={styles.helper}>{database.ready ? 'Nenhum produto encontrado com esse nome ou código.' : 'Importe uma planilha para visualizar os produtos aqui.'}</Text></View> : <View style={styles.catalogRows}>
             {catalogRows.map((item, index) => {
               const checked = selectedCatalogRows.some(row => catalogSelectionKey(row) === catalogSelectionKey(item));
               return <Pressable key={`${catalogSelectionKey(item)}-${index}`} onPress={() => toggleCatalogRow(item)} accessibilityRole="checkbox" accessibilityState={{ checked }} style={[styles.catalogProductRow, { borderBottomColor: theme.surfaceVariant, backgroundColor: checked ? theme.primaryContainer : theme.surface }]}>

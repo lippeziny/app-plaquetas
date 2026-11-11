@@ -82,7 +82,7 @@ async function getDb(): Promise<SQLiteDatabase> {
 }
 
 export async function initializeCatalogStore(): Promise<void> {
-  if (Platform.OS !== 'web') await getDb();
+  if (Platform.OS !== 'web') { await getDb(); await ensureCatalogSearchIndex().catch(error => console.warn('Falha ao reconstruir o índice de busca', error)); }
 }
 
 function getWebCatalog(): CatalogRow[] {
@@ -134,67 +134,112 @@ export async function replaceCatalogFromItems(items: CatalogItem[]): Promise<voi
     row => [row.id, row.code, row.name, row.quantity, row.sheetName, row.codeNorm, row.nameNorm]);
 }
 
+// ---------------------------------------------------------------------------
+// Search helpers. Matching is accent/case-insensitive, accepts several words in
+// any order ("vassoura grande"), and finds the text anywhere in the name. The
+// code also matches anywhere and ignores punctuation and leading zeros.
+// instr() is used instead of LIKE so %, _ and \ typed by the user are harmless.
+// ---------------------------------------------------------------------------
+function searchTokens(query: string): string[] {
+  return normalize(query).split(/\s+/).filter(Boolean);
+}
+function compactCode(value: string): string {
+  return normalize(value).replace(/[^a-z0-9]/g, '');
+}
+function codeNeedles(query: string): string[] {
+  const plain = normalize(query);
+  const compact = compactCode(query);
+  const noZeros = compact.replace(/^0+(?=.)/, '');
+  return [...new Set([plain, compact, noZeros].filter(Boolean))];
+}
+
+/** WHERE fragment + params matching the name (all words) OR the code (any needle). */
+function buildMatch(query: string): { where: string; params: string[]; rank: string; rankParams: string[] } | null {
+  const tokens = searchTokens(query);
+  if (!tokens.length) return null;
+  const nameClause = tokens.map(() => 'instr(name_norm, ?) > 0').join(' AND ');
+  const needles = codeNeedles(query);
+  // Codes are also compared without . - / and spaces, so "12345" finds "1.234-5".
+  const compactCodeSql = `replace(replace(replace(replace(code_norm, '.', ''), '-', ''), ' ', ''), '/', '')`;
+  const codeClause = needles.map(() => `instr(code_norm, ?) > 0 OR instr(${compactCodeSql}, ?) > 0`).join(' OR ');
+  const full = tokens.join(' ');
+  return {
+    where: `((${nameClause}) OR (${codeClause}))`,
+    params: [...tokens, ...needles.flatMap(needle => [needle, needle])],
+    // 0 = exact code, 1 = code starts with, 2 = name starts with, 3 = anything else
+    rank: `CASE WHEN code_norm = ? THEN 0 WHEN substr(code_norm, 1, ?) = ? THEN 1 WHEN substr(name_norm, 1, ?) = ? THEN 2 ELSE 3 END`,
+    rankParams: [needles[0], needles[0].length as any, needles[0], full.length as any, full],
+  };
+}
+
+function matchesItem(item: CatalogItem, query: string): boolean {
+  const tokens = searchTokens(query);
+  if (!tokens.length) return true;
+  const name = normalize(item.name);
+  const code = normalize(item.code);
+  const codeCompact = compactCode(item.code);
+  return tokens.every(token => name.includes(token))
+    || codeNeedles(query).some(needle => code.includes(needle) || codeCompact.includes(needle));
+}
+
+function rankItem(item: CatalogItem, query: string): number {
+  const full = searchTokens(query).join(' ');
+  const code = normalize(item.code);
+  if (code === full) return 0;
+  if (code.startsWith(full)) return 1;
+  if (normalize(item.name).startsWith(full)) return 2;
+  return 3;
+}
+
 export async function searchCatalogSuggestions(
   query: string,
   field: 'code' | 'name',
   limit = 8,
 ): Promise<CatalogItem[]> {
-  const normalized = normalize(query);
-  if (!normalized) return [];
+  const match = buildMatch(query);
+  if (!match) return [];
+  const safeLimit = Math.max(1, Math.min(50, Math.floor(limit)));
   if (Platform.OS === 'web') {
-    const items = getWebCatalog();
-    const target = field === 'code' ? 'code' : 'name';
-    const prefix = items.filter(item => normalize(item[target]).startsWith(normalized));
-    const remainder = field === 'name'
-      ? items.filter(item => normalize(item.name).includes(normalized) && !normalize(item.name).startsWith(normalized))
-      : [];
-    return [...prefix, ...remainder].slice(0, limit);
+    return getWebCatalog()
+      .filter(item => matchesItem(item, query))
+      .sort((a, b) => rankItem(a, query) - rankItem(b, query)
+        || normalize(field === 'code' ? a.code : a.name).localeCompare(normalize(field === 'code' ? b.code : b.name)))
+      .slice(0, safeLimit);
   }
   const db = await getDb();
-  const target = field === 'code' ? 'code_norm' : 'name_norm';
-  const escaped = normalized.replace(/[\\%_]/g, '\\$&');
-  const prefixRows = await db.getAllAsync<CatalogRow>(
-    `SELECT code, name, quantity, sheet_name AS sheetName FROM catalog WHERE ${target} LIKE ? ESCAPE '\\' ORDER BY ${target}, id LIMIT ?`,
-    `${escaped}%`, limit,
-  );
-  if (field === 'code' || prefixRows.length >= limit) return prefixRows;
-  const containsRows = await db.getAllAsync<CatalogRow>(
+  const orderField = field === 'code' ? 'code_norm' : 'name_norm';
+  return db.getAllAsync<CatalogRow>(
     `SELECT code, name, quantity, sheet_name AS sheetName FROM catalog
-     WHERE name_norm LIKE ? ESCAPE '\\' AND name_norm NOT LIKE ? ESCAPE '\\'
-     ORDER BY name_norm, id LIMIT ?`,
-    `%${escaped}%`, `${escaped}%`, limit - prefixRows.length,
+     WHERE ${match.where}
+     ORDER BY ${match.rank}, ${orderField}, id LIMIT ?`,
+    ...match.params, ...match.rankParams, safeLimit,
   );
-  return [...prefixRows, ...containsRows];
 }
 
-/** Loads a bounded page from the local catalog. Name filtering is accent-insensitive
- * and supports text anywhere in the product description (e.g. "calca"). */
+/** Loads a bounded page from the local catalog (name words or code, accent-insensitive). */
 export async function searchStockCatalogPage(
   query = '',
   limit = 60,
   offset = 0,
 ): Promise<CatalogItem[]> {
-  const normalized = normalize(query);
   const safeLimit = Math.max(1, Math.min(100, Math.floor(limit)));
   const safeOffset = Math.max(0, Math.floor(offset));
+  const match = buildMatch(query);
   if (Platform.OS === 'web') {
     const items = getWebCatalog();
-    const filtered = normalized
-      ? items.filter(item => normalize(item.name).includes(normalized))
-      : items;
-    filtered.sort((a, b) => normalize(a.name).localeCompare(normalize(b.name)));
+    const filtered = match ? items.filter(item => matchesItem(item, query)) : items;
+    filtered.sort((a, b) => (match ? rankItem(a, query) - rankItem(b, query) : 0)
+      || normalize(a.name).localeCompare(normalize(b.name)));
     return filtered.slice(safeOffset, safeOffset + safeLimit);
   }
   const db = await getDb();
-  if (normalized) {
-    // Escaping prevents %, _ and \\ typed by the user from becoming SQL wildcards.
-    const escaped = normalized.replace(/[\\%_]/g, '\\$&');
+  if (match) {
     return db.getAllAsync<CatalogRow>(
       `SELECT code, name, quantity, sheet_name AS sheetName
-       FROM catalog WHERE name_norm LIKE ? ESCAPE '\\'
-       ORDER BY CASE WHEN name_norm LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END, name_norm, id
+       FROM catalog WHERE ${match.where}
+       ORDER BY ${match.rank}, name_norm, id
        LIMIT ? OFFSET ?`,
-      `%${escaped}%`, `${escaped}%`, safeLimit, safeOffset,
+      ...match.params, ...match.rankParams, safeLimit, safeOffset,
     );
   }
   return db.getAllAsync<CatalogRow>(
@@ -208,40 +253,56 @@ export const getCatalogPage = searchStockCatalogPage;
 
 /** Counts matches against the complete imported stock catalog, never the label-selection array. */
 export async function countStockCatalogMatches(query = ''): Promise<number> {
-  const normalized = normalize(query);
+  const match = buildMatch(query);
   if (Platform.OS === 'web') {
     const items = getWebCatalog();
-    return normalized ? items.filter(item => normalize(item.name).includes(normalized)).length : items.length;
+    return match ? items.filter(item => matchesItem(item, query)).length : items.length;
   }
   const db = await getDb();
-  if (!normalized) {
+  if (!match) {
     const row = await db.getFirstAsync<{ total: number }>('SELECT COUNT(*) AS total FROM catalog');
     return Number(row?.total || 0);
   }
-  const escaped = normalized.replace(/[\\%_]/g, '\\$&');
   const row = await db.getFirstAsync<{ total: number }>(
-    `SELECT COUNT(*) AS total FROM catalog WHERE name_norm LIKE ? ESCAPE '\\'`, `%${escaped}%`,
+    `SELECT COUNT(*) AS total FROM catalog WHERE ${match.where}`, ...match.params,
   );
   return Number(row?.total || 0);
 }
 
 export async function searchCatalogNames(query: string, limit = 8): Promise<CatalogItem[]> {
-  const normalized = normalize(query);
-  if (!normalized) return [];
-  if (Platform.OS === 'web') return getWebCatalog().filter(item => normalize(item.name).includes(normalized)).slice(0, limit);
+  return searchCatalogSuggestions(query, 'name', limit);
+}
+
+/** Rebuilds code_norm / name_norm when they are missing or out of date (for example a
+ * catalog saved by an older version). Without these columns every search finds nothing.
+ * Cheap on a healthy database: it only samples a few rows and counts empty keys. */
+export async function ensureCatalogSearchIndex(): Promise<{ rebuilt: boolean; rows: number }> {
+  if (Platform.OS === 'web') return { rebuilt: false, rows: 0 };
   const db = await getDb();
-  let rows = await db.getAllAsync<CatalogRow>(
-    'SELECT code, name, quantity, sheet_name AS sheetName FROM catalog WHERE name_norm LIKE ? ORDER BY name_norm LIMIT ?',
-    `${normalized}%`, limit,
+  const total = Number((await db.getFirstAsync<{ total: number }>('SELECT COUNT(*) AS total FROM catalog'))?.total || 0);
+  if (!total) return { rebuilt: false, rows: 0 };
+  const empty = Number((await db.getFirstAsync<{ total: number }>(
+    `SELECT COUNT(*) AS total FROM catalog WHERE name_norm = '' OR code_norm = '' OR name_norm IS NULL OR code_norm IS NULL`,
+  ))?.total || 0);
+  const sample = await db.getAllAsync<{ code: string; name: string; code_norm: string; name_norm: string }>(
+    'SELECT code, name, code_norm, name_norm FROM catalog ORDER BY id LIMIT 300',
   );
-  if (rows.length < limit) {
-    const extras = await db.getAllAsync<CatalogRow>(
-      'SELECT code, name, quantity, sheet_name AS sheetName FROM catalog WHERE name_norm LIKE ? AND name_norm NOT LIKE ? ORDER BY name_norm LIMIT ?',
-      `%${normalized}%`, `${normalized}%`, limit - rows.length,
+  const stale = sample.some(row => normalize(row.name) !== String(row.name_norm || '') || normalize(row.code) !== String(row.code_norm || ''));
+  if (!empty && !stale) return { rebuilt: false, rows: total };
+  let lastId = -1;
+  while (true) {
+    const rows = await db.getAllAsync<{ id: number; code: string; name: string }>(
+      'SELECT id, code, name FROM catalog WHERE id > ? ORDER BY id LIMIT 1000', lastId,
     );
-    rows = [...rows, ...extras];
+    if (!rows.length) break;
+    await db.withTransactionAsync(async () => {
+      for (const row of rows) {
+        await db.runAsync('UPDATE catalog SET code_norm = ?, name_norm = ? WHERE id = ?', normalize(row.code), normalize(row.name), row.id);
+      }
+    });
+    lastId = rows[rows.length - 1].id;
   }
-  return rows;
+  return { rebuilt: true, rows: total };
 }
 
 export async function findCatalogItems(values: string[], field: 'code' | 'name'): Promise<Map<string, CatalogItem>> {

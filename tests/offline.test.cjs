@@ -312,7 +312,8 @@ test('catalog browser filters the complete imported stock database, not the sele
   assert.match(catalogSource, /export async function searchCatalogSuggestions\([\s\S]*?field: 'code' \| 'name'/);
   assert.match(catalogSource, /export async function searchStockCatalogPage\(/);
   assert.match(catalogSource, /export async function countStockCatalogMatches\(/);
-  assert.match(catalogSource, /name_norm LIKE \?/);
+  assert.match(catalogSource, /instr\(name_norm, \?\)/);
+  assert.match(catalogSource, /export async function ensureCatalogSearchIndex\(/);
   assert.match(appSource, /searchCatalogSuggestions\(query, inputMode, 10\)/);
   assert.match(appSource, /quickSearchQuery/);
   assert.match(appSource, /Buscar um produto com preenchimento automático/);
@@ -324,7 +325,7 @@ test('catalog browser filters the complete imported stock database, not the sele
   assert.match(appSource, /Adicionar \$\{selectedCatalogRows\.length\} selecionado/);
   assert.match(appSource, /accessibilityRole="checkbox"/);
   assert.match(appSource, /Carregar mais produtos/);
-  assert.match(catalogSource, /FROM catalog WHERE name_norm LIKE/);
+  assert.match(catalogSource, /FROM catalog WHERE \$\{match\.where\}/);
   assert.match(appSource, /stockWorkbookUri/);
   assert.match(appSource, /chooseDefaultStockSheet/);
   assert.match(appSource, /stockColumnMappings/);

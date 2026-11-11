@@ -89,3 +89,14 @@ O fluxo de importação do modelo personalizado ainda chamava a função removid
 - Corrigido o teste `catalog browser filters the complete imported stock database`: ele usava a variável `importer` sem declará-la no próprio escopo do teste.
 - O teste agora lê explicitamente `offline/streaming-xlsx.ts` antes de validar a detecção de cabeçalhos e a prévia de até 30 linhas.
 - Nenhuma lógica de produção do app foi alterada nesta correção; o filtro do catálogo continua consultando a tabela `catalog` completa.
+
+
+## v4.5.2 — busca por nome/código e filtro do estoque
+
+- A busca deixou de depender de `LIKE ... ESCAPE`: agora usa `instr()` sobre `name_norm` e `code_norm`, sem problemas com `%`, `_` e `\` digitados.
+- O nome aceita várias palavras em qualquer ordem ("vassoura grande"), sem acento e sem diferenciar maiúsculas/minúsculas, e encontra o texto em qualquer parte do nome (antes o código só aceitava o começo).
+- O código encontra o trecho em qualquer posição e ignora pontos, hifens, barras, espaços e zeros à esquerda ("12345" acha "1.234-5"; "123" acha "000123").
+- O filtro "Todos os produtos do estoque" e as sugestões do autocomplete usam a mesma regra e ordenam: código exato, código que começa com o texto, nome que começa com o texto, demais.
+- Novo `ensureCatalogSearchIndex()`: ao abrir o app, confere uma amostra do catálogo e reconstrói `code_norm`/`name_norm` se estiverem vazios ou desatualizados (por exemplo, base salva por versão antiga). Sem essas colunas, nenhuma busca encontrava nada.
+- Erros da busca por sugestão agora aparecem na tela em vez de virarem "Nenhuma sugestão encontrada".
+- Testes de regressão ajustados para a nova consulta. Não consegui rodar `npm test` neste ambiente (sem rede para instalar dependências); rode `npm install && npm test && npm run typecheck` antes do build.
