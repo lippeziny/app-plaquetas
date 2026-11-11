@@ -25,7 +25,7 @@ import TemplatePreview from './offline/TemplatePreview';
 import { buildLabelsPdfHtml } from './offline/pdf';
 import { normalizeSearch } from './offline/text';
 import { cleanupWorkbookFile, importXlsxSheetToCatalog, inspectXlsxFile, previewXlsxSheet, type WorkbookFileSource, type ImportProgress } from './offline/streaming-xlsx';
-import { findCatalogByCode, findCatalogItems, getCatalogCount, initializeCatalogStore, replaceCatalogFromItems, searchCatalogNames } from './offline/catalog-db';
+import { findCatalogByCode, findCatalogItems, getCatalogCount, getCatalogPage, initializeCatalogStore, replaceCatalogFromItems, searchCatalogSuggestions } from './offline/catalog-db';
 import { EMPTY_LOCAL_DATA, readLocalData, writeLocalData, type StoredAppData } from './offline/storage';
 import { Ionicons } from '@expo/vector-icons';
 
@@ -96,6 +96,7 @@ function estimateRemainingSeconds(percent: number, elapsedMs: number, recentSpee
   return Math.max(0, Math.round(recentEta * 0.65 + averageEta * 0.35));
 }
 function splitValues(text: string) { return text.split(/[\n,;\t]+/).map(v => v.trim()).filter(Boolean); }
+function catalogSelectionKey(item: CatalogItem) { return `${normalizeSearch(item.code)}::${normalizeSearch(item.name)}`; }
 function parseShapeIds(value: string) { return value.split(/[\s,;]+/).map(v => v.trim()).filter(Boolean); }
 function bytesToBase64(bytes: Uint8Array): string {
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
@@ -261,6 +262,14 @@ function AppScreen() {
   const [inputMode, setInputMode] = useState<'code' | 'name'>('code');
   const [inputText, setInputText] = useState('');
   const [suggestions, setSuggestions] = useState<CatalogItem[]>([]);
+  const lastPickedSuggestionRef = useRef('');
+  const [catalogSearch, setCatalogSearch] = useState('');
+  const catalogSearchRef = useRef('');
+  const [catalogRows, setCatalogRows] = useState<CatalogItem[]>([]);
+  const [catalogRowsLoading, setCatalogRowsLoading] = useState(false);
+  const [catalogRowsOffset, setCatalogRowsOffset] = useState(0);
+  const [catalogRowsHasMore, setCatalogRowsHasMore] = useState(false);
+  const [selectedCatalogRows, setSelectedCatalogRows] = useState<CatalogItem[]>([]);
   const [labels, setLabels] = useState<LabelItem[]>([]);
   const [activeLabelIndex, setActiveLabelIndex] = useState(0);
   const [compactPreview, setCompactPreview] = useState(false);
@@ -365,13 +374,44 @@ function AppScreen() {
   }, [persistPatch]);
 
   useEffect(() => {
-    if (inputMode !== 'name' || inputText.trim().length < 2 || !localReady) { setSuggestions([]); return; }
     const query = normalizeSearch(inputText.split(/[\n,;]+/).pop() || '');
-    if (!query) { setSuggestions([]); return; }
+    if (query.length < 2 || query === lastPickedSuggestionRef.current || !localReady || !database.ready) { setSuggestions([]); return; }
     let active = true;
-    searchCatalogNames(query, 8).then(rows => { if (active) setSuggestions(rows); }).catch(() => { if (active) setSuggestions([]); });
-    return () => { active = false; };
-  }, [inputText, inputMode, localReady]);
+    const timer = setTimeout(() => {
+      searchCatalogSuggestions(query, inputMode, 8)
+        .then(rows => { if (active) setSuggestions(rows); })
+        .catch(() => { if (active) setSuggestions([]); });
+    }, 160);
+    return () => { active = false; clearTimeout(timer); };
+  }, [inputText, inputMode, localReady, database.ready]);
+
+  // The browseable stock list is paginated, so a catalog with hundreds of
+  // thousands of products never gets materialized in React memory at once.
+  useEffect(() => {
+    if (!localReady || !database.ready) {
+      setCatalogRows([]);
+      setCatalogRowsOffset(0);
+      setCatalogRowsHasMore(false);
+      setCatalogRowsLoading(false);
+      return;
+    }
+    let active = true;
+    const timer = setTimeout(async () => {
+      setCatalogRowsLoading(true);
+      try {
+        const rows = await getCatalogPage(catalogSearch, 60, 0);
+        if (!active) return;
+        setCatalogRows(rows);
+        setCatalogRowsOffset(rows.length);
+        setCatalogRowsHasMore(rows.length === 60);
+      } catch (error: any) {
+        if (active) showMessage(error?.message || 'Não foi possível pesquisar a base de estoque.');
+      } finally {
+        if (active) setCatalogRowsLoading(false);
+      }
+    }, 220);
+    return () => { active = false; clearTimeout(timer); };
+  }, [catalogSearch, database.ready, catalogCount, localReady]);
 
   const refreshCounts = useCallback(async () => {
     const stored = await readLocalData();
@@ -464,6 +504,12 @@ function AppScreen() {
       await persistPatch({ catalog: [], database: meta });
       setCatalogCount(result.total);
       setDatabase(meta);
+      setSelectedCatalogRows([]);
+      setCatalogSearch('');
+      catalogSearchRef.current = '';
+      setCatalogRows([]);
+      setCatalogRowsOffset(0);
+      setCatalogRowsHasMore(false);
       await cleanupWorkbookFile(workbookData);
       setWorkbookData(null);
       setSheetNames([]);
@@ -528,6 +574,7 @@ function AppScreen() {
       setLabels(previous => [...previous, ...mapped]);
       setActiveLabelIndex(labels.length);
       setInputText('');
+      lastPickedSuggestionRef.current = '';
       setSuggestions([]);
       const missing = entries.filter(entry => !entry.item).length;
       if (missing) showMessage(`${mapped.length - missing} item(ns) encontrado(s) na base local. ${missing} precisa(m) de revisão manual.`);
@@ -535,10 +582,61 @@ function AppScreen() {
     finally { setBusy(''); }
   };
 
+  const handleInputTextChange = (value: string) => {
+    lastPickedSuggestionRef.current = '';
+    setInputText(value);
+  };
+
   const chooseSuggestion = (item: CatalogItem) => {
     const before = inputText.split(/[\n,;]+/).slice(0, -1).join('\n');
-    setInputText(`${before ? `${before}\n` : ''}${item.name}`);
+    const value = inputMode === 'code' ? item.code : item.name;
+    lastPickedSuggestionRef.current = normalizeSearch(value);
+    setInputText(`${before ? `${before}\n` : ''}${value}`);
     setSuggestions([]);
+  };
+
+  const toggleCatalogRow = (item: CatalogItem) => {
+    const key = catalogSelectionKey(item);
+    setSelectedCatalogRows(previous => previous.some(row => catalogSelectionKey(row) === key)
+      ? previous.filter(row => catalogSelectionKey(row) !== key)
+      : [...previous, item]);
+  };
+
+  const addSelectedCatalogRows = () => {
+    if (!selectedCatalogRows.length) return;
+    if (selectedCatalogRows.length > 1000) return showMessage('Adicione até 1.000 produtos selecionados por vez.');
+    const mapped: LabelItem[] = selectedCatalogRows.map(item => ({ ...item, localId: makeId() }));
+    setLabels(previous => [...previous, ...mapped]);
+    setActiveLabelIndex(labels.length);
+    setSelectedCatalogRows([]);
+    showMessage(`${mapped.length} produto(s) adicionado(s) à lista de plaquetas.`);
+  };
+
+  const updateCatalogSearch = (value: string) => {
+    catalogSearchRef.current = value;
+    setCatalogSearch(value);
+    setCatalogRows([]);
+    setCatalogRowsOffset(0);
+    setCatalogRowsHasMore(false);
+    setCatalogRowsLoading(!!database.ready);
+  };
+
+  const loadMoreCatalogRows = async () => {
+    if (catalogRowsLoading || !catalogRowsHasMore) return;
+    const requestQuery = catalogSearch;
+    const requestOffset = catalogRowsOffset;
+    setCatalogRowsLoading(true);
+    try {
+      const rows = await getCatalogPage(requestQuery, 60, requestOffset);
+      if (catalogSearchRef.current !== requestQuery) return;
+      setCatalogRows(previous => [...previous, ...rows]);
+      setCatalogRowsOffset(requestOffset + rows.length);
+      setCatalogRowsHasMore(rows.length === 60);
+    } catch (error: any) {
+      if (catalogSearchRef.current === requestQuery) showMessage(error?.message || 'Não foi possível carregar mais produtos.');
+    } finally {
+      if (catalogSearchRef.current === requestQuery) setCatalogRowsLoading(false);
+    }
   };
 
   const updateLabel = (localId: string, field: 'code' | 'name', value: string) => {
@@ -738,17 +836,52 @@ function AppScreen() {
       {workflowStep === 'items' && <Card style={[styles.materialCard, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]}>
         <SectionTitle eyebrow="PASSO 2 DE 3" title="Quais plaquetas você precisa?" subtitle="Digite ou cole uma lista. O app procura os códigos e nomes na base salva no celular." accent={theme.primary} />
         <View style={[styles.segmented, { backgroundColor: theme.surfaceContainer }]}>
-          <Pressable onPress={() => { setInputMode('code'); setSuggestions([]); }} style={[styles.segment, inputMode === 'code' && { backgroundColor: theme.surface, borderRadius: 12 }]}><Text style={[styles.segmentText, inputMode === 'code' && { color: theme.primary }]}>Por código</Text></Pressable>
-          <Pressable onPress={() => { setInputMode('name'); setSuggestions([]); }} style={[styles.segment, inputMode === 'name' && { backgroundColor: theme.surface, borderRadius: 12 }]}><Text style={[styles.segmentText, inputMode === 'name' && { color: theme.primary }]}>Por nome</Text></Pressable>
+          <Pressable onPress={() => { setInputMode('code'); lastPickedSuggestionRef.current = ''; setSuggestions([]); }} style={[styles.segment, inputMode === 'code' && { backgroundColor: theme.surface, borderRadius: 12 }]}><Text style={[styles.segmentText, inputMode === 'code' && { color: theme.primary }]}>Por código</Text></Pressable>
+          <Pressable onPress={() => { setInputMode('name'); lastPickedSuggestionRef.current = ''; setSuggestions([]); }} style={[styles.segment, inputMode === 'name' && { backgroundColor: theme.surface, borderRadius: 12 }]}><Text style={[styles.segmentText, inputMode === 'name' && { color: theme.primary }]}>Por nome</Text></Pressable>
         </View>
-        <TextInput value={inputText} onChangeText={setInputText} multiline textAlignVertical="top" placeholder={inputMode === 'code' ? 'Cole os códigos aqui, um por linha…\nEx.: 76120200487\n76150100651' : 'Digite parte do nome do material…'} style={[styles.textInput, styles.listInput, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant, minHeight: 126, borderRadius: 16 }]} />
-        {inputMode === 'name' && suggestions.length > 0 && <View style={[styles.suggestionPanel, { borderColor: theme.surfaceVariant, backgroundColor: theme.surface }]}>
-          {suggestions.slice(0, 6).map((item, i) => <Pressable key={`${item.code}-${i}`} onPress={() => chooseSuggestion(item)} style={styles.suggestionRow}>
-            <View style={{ flex: 1 }}><Text style={styles.suggestionName}>{item.name}</Text><Text style={styles.helper}>Código: {item.code} · Estoque: {item.quantity || '—'}</Text></View><Ionicons name="add-circle" size={21} color={theme.primary} />
+        <TextInput value={inputText} onChangeText={handleInputTextChange} multiline textAlignVertical="top" placeholder={inputMode === 'code' ? 'Cole os códigos aqui, um por linha…\nEx.: 76120200487\n76150100651' : 'Digite parte do nome do material…'} style={[styles.textInput, styles.listInput, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant, minHeight: 126, borderRadius: 16 }]} />
+        {suggestions.length > 0 && <View style={[styles.suggestionPanel, { borderColor: theme.surfaceVariant, backgroundColor: theme.surface }]}>
+          <Text style={[styles.catalogSectionCaption, { color: theme.primary }]}>SUGESTÕES {inputMode === 'code' ? 'POR CÓDIGO' : 'POR NOME'}</Text>
+          {suggestions.slice(0, 8).map((item, i) => <Pressable key={`${item.code}-${i}`} onPress={() => chooseSuggestion(item)} style={styles.suggestionRow}>
+            <View style={{ flex: 1 }}><Text style={styles.suggestionName}>{item.name}</Text><Text style={styles.helper}>Código: {item.code}</Text></View><Ionicons name="arrow-down-circle-outline" size={21} color={theme.primary} />
           </Pressable>)}
         </View>}
         <ActionButton title="Adicionar à lista" onPress={addItems} icon="add" primaryColor={theme.primary} disabled={!!busy || !localReady} />
-        <View style={[styles.listSummary, { backgroundColor: theme.surfaceContainer }]}><Text style={[styles.listSummaryTitle, { color: theme.primary }]}>{labels.length} plaqueta(s) na lista</Text><Text style={styles.helper}>{labels.length ? `Serão necessárias ${requiredPages} folha(s), com ${capacity} posições por folha.` : 'Ainda não há itens. Cole uma lista acima para começar.'}</Text></View>
+
+        <View style={[styles.catalogBrowser, { backgroundColor: theme.surface, borderColor: theme.surfaceVariant }]}>
+          <View style={styles.catalogBrowserHeader}>
+            <View style={{ flex: 1, gap: 3 }}>
+              <Text style={[styles.catalogBrowserTitle, { color: theme.onPrimaryContainer }]}>Escolher direto da planilha</Text>
+              <Text style={styles.helper}>{catalogCount.toLocaleString('pt-BR')} produtos na base · marque os que deseja gerar</Text>
+            </View>
+            <View style={[styles.catalogCountPill, { backgroundColor: theme.primaryContainer }]}><Text style={[styles.catalogCountPillText, { color: theme.primary }]}>{selectedCatalogRows.length} selecionado(s)</Text></View>
+          </View>
+          <View style={[styles.catalogSearchWrap, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant }]}>
+            <Ionicons name="search-outline" size={19} color={theme.outline} />
+            <TextInput value={catalogSearch} onChangeText={updateCatalogSearch} placeholder="Filtrar produtos pelo nome…" placeholderTextColor={theme.outline} returnKeyType="search" style={styles.catalogSearchInput} />
+            {!!catalogSearch && <Pressable onPress={() => updateCatalogSearch('')} hitSlop={8}><Ionicons name="close-circle" size={18} color={theme.outline} /></Pressable>}
+          </View>
+          {catalogRowsLoading && catalogRows.length === 0 ? <View style={styles.catalogLoading}><ActivityIndicator color={theme.primary} /><Text style={styles.helper}>Pesquisando no estoque…</Text></View> : catalogRows.length === 0 ? <View style={styles.catalogEmpty}><Ionicons name="search-outline" size={25} color={theme.outline} /><Text style={styles.helper}>{database.ready ? 'Nenhum produto encontrado com esse nome.' : 'Importe uma planilha para visualizar os produtos aqui.'}</Text></View> : <View style={styles.catalogRows}>
+            {catalogRows.map((item, index) => {
+              const checked = selectedCatalogRows.some(row => catalogSelectionKey(row) === catalogSelectionKey(item));
+              return <Pressable key={`${catalogSelectionKey(item)}-${index}`} onPress={() => toggleCatalogRow(item)} accessibilityRole="checkbox" accessibilityState={{ checked }} style={[styles.catalogProductRow, { borderBottomColor: theme.surfaceVariant, backgroundColor: checked ? theme.primaryContainer : theme.surface }]}>
+                <Ionicons name={checked ? 'checkbox' : 'square-outline'} size={23} color={checked ? theme.primary : theme.outline} />
+                <View style={styles.catalogProductText}>
+                  <Text style={[styles.catalogProductName, { color: theme.onPrimaryContainer }]} numberOfLines={2}>{item.name || 'Produto sem nome'}</Text>
+                  <Text style={[styles.catalogProductCode, { color: theme.secondary }]}>Código: {item.code || '—'}</Text>
+                </View>
+                {checked ? <Ionicons name="checkmark-circle" size={18} color={theme.primary} /> : null}
+              </Pressable>;
+            })}
+          </View>}
+          {catalogRowsHasMore && <Pressable onPress={loadMoreCatalogRows} disabled={catalogRowsLoading} style={[styles.catalogMoreButton, { borderColor: theme.primary }]}>
+            {catalogRowsLoading ? <ActivityIndicator size="small" color={theme.primary} /> : <Ionicons name="chevron-down-circle-outline" size={18} color={theme.primary} />}
+            <Text style={[styles.catalogMoreText, { color: theme.primary }]}>{catalogRowsLoading ? 'Carregando…' : 'Carregar mais produtos'}</Text>
+          </Pressable>}
+          <ActionButton title={`Adicionar ${selectedCatalogRows.length} selecionado(s)`} onPress={addSelectedCatalogRows} icon="checkmark-done-outline" primaryColor={theme.primary} disabled={!!busy || selectedCatalogRows.length === 0} />
+        </View>
+
+        <View style={[styles.listSummary, { backgroundColor: theme.surfaceContainer }]}><Text style={[styles.listSummaryTitle, { color: theme.primary }]}>{labels.length} plaqueta(s) na lista</Text><Text style={styles.helper}>{labels.length ? `Serão necessárias ${requiredPages} folha(s), com ${capacity} posições por folha.` : 'Escolha produtos na lista da planilha ou digite um nome/código para começar.'}</Text></View>
         {labels.length === 0 ? <View style={styles.emptyState}><Ionicons name="documents-outline" size={30} color={theme.outline} /><Text style={styles.emptyTitle}>Sua lista está vazia</Text><Text style={styles.helper}>Depois de adicionar, você poderá editar cada código e descrição.</Text></View> : <View style={styles.itemList}>
           {labels.map((item, index) => <View key={item.localId} style={[styles.itemEditor, { backgroundColor: theme.surfaceContainer, borderColor: theme.surfaceVariant, borderRadius: 16 }]}>
             <View style={styles.itemEditorTop}><Text style={[styles.itemNumber, { color: theme.primary }]}>PLAQUETA {String(index + 1).padStart(2, '0')}</Text><View style={{ flex: 1 }} /><Pressable onPress={() => removeLabel(item.localId)} hitSlop={8}><Ionicons name="trash-outline" size={18} color="#B3261E" /></Pressable></View>
@@ -922,7 +1055,7 @@ const styles = StyleSheet.create({
   mappingBlock: { gap: 10 }, fieldLabel: { color: INK, fontWeight: '800', fontSize: 11, marginTop: 2 }, miniLabel: { color: MUTED, fontWeight: '900', fontSize: 8, letterSpacing: 1.1, marginBottom: 4 }, pickerWrap: { borderWidth: 1, borderColor: LINE, backgroundColor: '#FAFCFA', borderRadius: 9, overflow: 'hidden', minHeight: 39, justifyContent: 'center' }, picker: { minHeight: 38, width: '100%', color: INK, fontSize: 11 }, mappingRow: { flexDirection: 'row', gap: 8 }, mappingRowMobile: { flexDirection: 'column' }, mappingField: { flex: 1, minWidth: 0, gap: 4 },
   previewTable: { borderWidth: 1, borderColor: LINE, borderRadius: 9, padding: 8, gap: 5, overflow: 'hidden' }, tableRow: { flexDirection: 'row', borderBottomWidth: 1, borderColor: '#EDF1EE' }, tableHead: { width: 112, color: GREEN, fontWeight: '900', fontSize: 9, padding: 5, backgroundColor: '#F2F7F3' }, tableCell: { width: 112, color: INK, fontSize: 9, padding: 5 },
   sizeChoices: { flexDirection: 'row', gap: 8 }, sizeChoice: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 7, borderWidth: 1, borderColor: LINE, borderRadius: 11, padding: 10, backgroundColor: '#FFFFFF' }, sizeChoiceActive: { backgroundColor: '#F0F7F2', borderColor: '#A9CBB5' }, sizeChoiceTitle: { color: INK, fontSize: 11, fontWeight: '800' }, sizeChoiceTitleActive: { color: GREEN }, sizeChoiceMeta: { color: MUTED, fontSize: 9, marginTop: 2 }, warningText: { color: '#9B6020', fontSize: 10, lineHeight: 15, backgroundColor: '#FFF7EA', padding: 8, borderRadius: 7 }, advancedMap: { gap: 7, borderTopWidth: 1, borderColor: LINE, paddingTop: 12 }, shapeList: { maxHeight: 170, borderWidth: 1, borderColor: LINE, borderRadius: 9, overflow: 'hidden' }, shapeRow: { flexDirection: 'row', alignItems: 'center', padding: 7, gap: 5, borderBottomWidth: 1, borderBottomColor: LINE }, shapeName: { color: INK, fontSize: 9, fontWeight: '800' }, shapeAssign: { borderRadius: 6, backgroundColor: '#EFF6F1', paddingHorizontal: 7, paddingVertical: 6 }, shapeAssignText: { color: GREEN, fontSize: 8, fontWeight: '900' },
-  segmented: { flexDirection: 'row', backgroundColor: '#F1F5F2', borderRadius: 10, padding: 3, alignSelf: 'flex-start' }, segment: { paddingHorizontal: 17, paddingVertical: 8, borderRadius: 8 }, segmentActive: { backgroundColor: '#FFFFFF', shadowColor: '#000000', shadowOpacity: 0.06, shadowRadius: 3, elevation: 1 }, segmentText: { fontSize: 11, color: MUTED, fontWeight: '800' }, segmentTextActive: { color: GREEN }, textInput: { minHeight: 40, borderWidth: 1, borderColor: LINE, borderRadius: 9, paddingHorizontal: 11, paddingVertical: 9, color: INK, backgroundColor: '#FFFFFF', fontSize: 12 }, listInput: { minHeight: 112, textAlignVertical: 'top', lineHeight: 20 }, rowActions: { flexDirection: 'row', alignItems: 'center', gap: 9, flexWrap: 'wrap' }, suggestionPanel: { borderWidth: 1, borderColor: '#D9E9DE', borderRadius: 10, overflow: 'hidden', backgroundColor: '#FBFDFC' }, suggestionRow: { flexDirection: 'row', alignItems: 'center', padding: 10, borderBottomWidth: 1, borderBottomColor: LINE, gap: 8 }, suggestionName: { color: INK, fontSize: 11, fontWeight: '800' },
+  segmented: { flexDirection: 'row', backgroundColor: '#F1F5F2', borderRadius: 10, padding: 3, alignSelf: 'flex-start' }, segment: { paddingHorizontal: 17, paddingVertical: 8, borderRadius: 8 }, segmentActive: { backgroundColor: '#FFFFFF', shadowColor: '#000000', shadowOpacity: 0.06, shadowRadius: 3, elevation: 1 }, segmentText: { fontSize: 11, color: MUTED, fontWeight: '800' }, segmentTextActive: { color: GREEN }, textInput: { minHeight: 40, borderWidth: 1, borderColor: LINE, borderRadius: 9, paddingHorizontal: 11, paddingVertical: 9, color: INK, backgroundColor: '#FFFFFF', fontSize: 12 }, listInput: { minHeight: 112, textAlignVertical: 'top', lineHeight: 20 }, rowActions: { flexDirection: 'row', alignItems: 'center', gap: 9, flexWrap: 'wrap' }, suggestionPanel: { borderWidth: 1, borderColor: '#D9E9DE', borderRadius: 12, overflow: 'hidden', backgroundColor: '#FBFDFC' }, catalogSectionCaption: { fontSize: 9, fontWeight: '900', letterSpacing: 1.1, paddingHorizontal: 11, paddingTop: 10, paddingBottom: 5 }, suggestionRow: { flexDirection: 'row', alignItems: 'center', padding: 10, borderBottomWidth: 1, borderBottomColor: LINE, gap: 8 }, suggestionName: { color: INK, fontSize: 12, fontWeight: '800' }, catalogBrowser: { borderWidth: 1, borderRadius: 18, padding: 12, gap: 11 }, catalogBrowserHeader: { flexDirection: 'row', alignItems: 'center', gap: 8 }, catalogBrowserTitle: { fontSize: 15, fontWeight: '900' }, catalogCountPill: { borderRadius: 20, paddingHorizontal: 9, paddingVertical: 7 }, catalogCountPillText: { fontSize: 9, fontWeight: '900' }, catalogSearchWrap: { minHeight: 46, borderWidth: 1, borderRadius: 13, paddingHorizontal: 11, flexDirection: 'row', alignItems: 'center', gap: 8 }, catalogSearchInput: { flex: 1, minWidth: 0, paddingVertical: 9, color: INK, fontSize: 12 }, catalogLoading: { minHeight: 90, alignItems: 'center', justifyContent: 'center', gap: 8 }, catalogEmpty: { minHeight: 92, alignItems: 'center', justifyContent: 'center', gap: 7 }, catalogRows: { borderWidth: 1, borderColor: LINE, borderRadius: 13, overflow: 'hidden' }, catalogProductRow: { minHeight: 62, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 11, paddingVertical: 9, gap: 10, borderBottomWidth: 1 }, catalogProductText: { flex: 1, minWidth: 0, gap: 3 }, catalogProductName: { fontSize: 12, fontWeight: '800' }, catalogProductCode: { fontSize: 10, fontWeight: '700' }, catalogMoreButton: { minHeight: 39, borderWidth: 1, borderRadius: 12, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 7 }, catalogMoreText: { fontSize: 11, fontWeight: '800' },
   previewControls: { flexDirection: 'row', alignSelf: 'flex-start', padding: 3, borderRadius: 8, backgroundColor: '#F0F4F1', gap: 3 }, previewToggle: { paddingHorizontal: 13, paddingVertical: 7, borderRadius: 6 }, previewToggleActive: { backgroundColor: '#FFFFFF' }, previewToggleText: { color: MUTED, fontSize: 10, fontWeight: '700' }, previewToggleTextActive: { color: GREEN }, labelStage: { backgroundColor: '#F6F8F6', padding: 12, borderRadius: 12, alignItems: 'center', gap: 8 }, labelPreview: { width: '100%', maxWidth: 400, minHeight: 225, backgroundColor: '#FFFFFF', borderWidth: 2, borderColor: '#111111' }, labelPreviewCompact: { maxWidth: 310, minHeight: 190 }, labelTop: { height: 54, flexDirection: 'row', borderBottomWidth: 2, borderColor: '#111111' }, logoCell: { width: '29%', borderRightWidth: 2, borderColor: '#111111', justifyContent: 'center', alignItems: 'center' }, logoText: { fontSize: 21, fontWeight: '900', letterSpacing: -1.7, color: '#1E2421' }, logoSub: { fontSize: 6, color: '#1E2421', fontWeight: '900', letterSpacing: 1 }, codeCell: { flex: 1, paddingHorizontal: 8, paddingVertical: 4, justifyContent: 'space-between' }, labelSmall: { fontSize: 9, color: '#111111', fontWeight: '800' }, labelCode: { textAlign: 'center', fontSize: 19, fontWeight: '900', color: '#111111', marginBottom: 2 }, itemCell: { flex: 1, paddingHorizontal: 7, paddingTop: 5, paddingBottom: 7, borderBottomWidth: 2, borderColor: '#111111', justifyContent: 'space-between' }, labelName: { fontSize: 17, lineHeight: 23, color: '#111111', fontWeight: '900', textAlign: 'center', marginHorizontal: 7, marginVertical: 8 }, labelBottom: { minHeight: 60, flexDirection: 'row' }, bottomCell: { flex: 1, padding: 4 }, labelNav: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 16 }, navCircle: { width: 30, height: 30, borderRadius: 15, backgroundColor: '#F1F5F2', alignItems: 'center', justifyContent: 'center' }, navCount: { color: INK, fontSize: 11, fontWeight: '800' },
   emptyState: { alignItems: 'center', paddingVertical: 22, gap: 6 }, emptyTitle: { color: INK, fontSize: 12, fontWeight: '800' }, itemList: { gap: 10 }, itemEditor: { borderWidth: 1, borderColor: LINE, borderRadius: 11, padding: 10, gap: 5, backgroundColor: '#FCFDFC' }, itemEditorTop: { flexDirection: 'row', alignItems: 'center', gap: 9, marginBottom: 3 }, itemNumber: { color: GREEN, fontSize: 10, fontWeight: '900' }, itemStock: { flex: 1, color: MUTED, fontSize: 9 }, editInput: { minHeight: 34, paddingHorizontal: 9, paddingVertical: 6, borderWidth: 1, borderColor: LINE, borderRadius: 7, color: INK, fontSize: 11, backgroundColor: '#FFFFFF' }, showPreviewLink: { flexDirection: 'row', alignItems: 'center', gap: 5, alignSelf: 'flex-start', paddingTop: 3 }, showPreviewText: { color: GREEN, fontSize: 9, fontWeight: '800' }, exportBox: { borderTopWidth: 1, borderColor: LINE, paddingTop: 13, marginTop: 2, gap: 10 }, exportTitle: { color: INK, fontSize: 13, fontWeight: '900' }, exportRow: { flexDirection: 'row', alignItems: 'center', gap: 12 }, pageInputWrap: { width: 78 }, pageInput: { borderWidth: 1, borderColor: LINE, borderRadius: 8, padding: 7, color: INK, fontWeight: '800', textAlign: 'center', minHeight: 34 }, exportButtons: { flexDirection: 'row', gap: 8 }, successText: { color: GREEN, fontSize: 9, fontWeight: '700' },
   footer: { alignItems: 'center', gap: 5, paddingTop: 12 }, footerText: { color: '#9BA79F', fontSize: 8, letterSpacing: 0.5 }, busyOverlay: { position: 'absolute', top: 0, bottom: 0, left: 0, right: 0, backgroundColor: 'rgba(244,247,244,0.55)', justifyContent: 'center', alignItems: 'center' }, busyCard: { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: '#FFFFFF', paddingHorizontal: 16, paddingVertical: 13, borderRadius: 12, borderWidth: 1, borderColor: LINE, elevation: 5 }, busyText: { color: INK, fontSize: 11, fontWeight: '800' },

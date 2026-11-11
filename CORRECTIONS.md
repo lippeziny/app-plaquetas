@@ -61,3 +61,13 @@ O fluxo de importação do modelo personalizado ainda chamava a função removid
 - Changed `File.open(FileMode.ReadOnly)` to `File.open()` as required by the project’s pinned Expo FileSystem typings.
 - Kept incremental 256 KB `readBytes` reads and the UTF-8 streaming decoder unchanged.
 - Added a regression assertion to the offline test suite so the unsupported call is not reintroduced.
+
+
+## v4.4.0 — pesquisa e seleção direta do catálogo
+
+- Adicionada busca de sugestões por prefixo para nome e código, com preenchimento do valor completo ao tocar em uma sugestão.
+- A busca usa os índices `name_norm` e `code_norm` do SQLite e normalização sem acentos.
+- Adicionado catálogo diretamente na etapa Itens: exibe nome e código com caixa de seleção, filtro por trecho do nome e paginação de 60 registros.
+- A seleção de produtos permanece entre alterações do filtro e pode ser adicionada em lote às plaquetas; ao importar uma nova base, as seleções antigas são limpas.
+- Ajustado o recorte das imagens na prévia conforme os metadados `a:srcRect` / `a:fillRect` do PowerPoint. O logotipo CKTR usa `cover` para respeitar o recorte horizontal original; imagens sem recorte continuam em `contain`.
+- Incluídos testes de regressão para busca por nome/código, catálogo paginado, seleção por checkbox e modo de encaixe da imagem.

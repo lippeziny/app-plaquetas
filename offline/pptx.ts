@@ -21,6 +21,7 @@ export type TemplateVisual = {
   verticalAlign?: 'top' | 'center' | 'bottom';
   imageBase64?: string;
   imageMime?: string;
+  imageFit?: 'contain' | 'cover';
 };
 export type TemplateSlide = {
   index: number;
@@ -282,6 +283,9 @@ async function parseSlideVisuals(zip: JSZip, slidePath: string, slideXml: string
       const text = [...object.block.matchAll(/<a:t(?:\s[^>]*)?>([\s\S]*?)<\/a:t>/g)].map(item => decodeXml(item[1])).join('');
       const imageRelId = object.block.match(/<a:blip\b[^>]*r:embed="([^"]+)"/)?.[1];
       const imageInfo = imageRelId ? media.get(imageRelId) : undefined;
+      const sourceRect = spPr.match(/<a:srcRect\b([^>]*)\/?\s*>/)?.[1] || '';
+      const fillRect = spPr.match(/<a:fillRect\b([^>]*)\/?\s*>/)?.[1] || '';
+      const hasImageCrop = [sourceRect, fillRect].some(attrs => attrs && /(?:l|t|r|b)="(?!0")[^"]+"/.test(attrs));
       let imageBase64: string | undefined;
       if (imageInfo && imageInfo.mime !== 'image/svg+xml') {
         const file = zip.file(imageInfo.path);
@@ -298,7 +302,7 @@ async function parseSlideVisuals(zip: JSZip, slidePath: string, slideXml: string
         fill: firstHex(fillSection), stroke: firstHex(lineSection),
         strokeWidth: Number.isFinite(borderWidth) && borderWidth > 0 ? borderWidth : undefined,
         ...textStyle,
-        imageBase64, imageMime: imageInfo?.mime,
+        imageBase64, imageMime: imageInfo?.mime, imageFit: hasImageCrop ? 'cover' : 'contain',
       });
     }
   };

@@ -39,6 +39,7 @@ test('inspects the bundled template locally and finds both 8-label layouts', asy
   assert.equal(info.slides[0].orientation, 'portrait');
   assert.ok(info.slides[0].visuals.length > 0, 'the live preview must contain the original slide geometry');
   assert.ok(info.slides[0].visuals.some(item => item.kind === 'image' && item.imageBase64), 'template logos/images must be embedded in the preview data');
+  assert.ok(info.slides[0].visuals.some(item => item.kind === 'image' && item.imageFit === 'cover'), 'PowerPoint crop instructions must be reflected in image preview sizing');
 });
 
 test('generates a valid multi-page PPTX locally without any server', async () => {
@@ -256,4 +257,23 @@ test('app exposes the real template preview, global/individual adjustments and M
   for (const theme of ["id: 'azul'", "id: 'verde'", "id: 'roxo'", "id: 'laranja'", "id: 'turquesa'"]) assert.ok(app.includes(theme));
   assert.match(app, /<TemplatePreview/);
   assert.match(preview, /visual\.imageBase64/);
+});
+
+
+test('catalog browser supports name filtering, paged results and code/name suggestions', () => {
+  const catalogSource = fs.readFileSync(path.resolve(__dirname, '..', 'offline', 'catalog-db.ts'), 'utf8');
+  const appSource = fs.readFileSync(path.resolve(__dirname, '..', 'App.tsx'), 'utf8');
+  assert.match(catalogSource, /export async function searchCatalogSuggestions\([\s\S]*?field: 'code' \| 'name'/);
+  assert.match(catalogSource, /export async function getCatalogPage\(/);
+  assert.match(catalogSource, /name_norm LIKE \?/);
+  assert.match(appSource, /searchCatalogSuggestions\(query, inputMode, 8\)/);
+  assert.match(appSource, /Filtrar produtos pelo nome/);
+  assert.match(appSource, /Adicionar \$\{selectedCatalogRows\.length\} selecionado/);
+  assert.match(appSource, /accessibilityRole="checkbox"/);
+  assert.match(appSource, /Carregar mais produtos/);
+});
+
+test('live PPTX preview crops embedded square logo artwork to the actual wide shape bounds', () => {
+  const previewSource = fs.readFileSync(path.resolve(__dirname, '..', 'offline', 'TemplatePreview.tsx'), 'utf8');
+  assert.match(previewSource, /resizeMode=\{visual\.imageFit \|\| 'contain'\}/);
 });

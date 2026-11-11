@@ -134,6 +134,63 @@ export async function replaceCatalogFromItems(items: CatalogItem[]): Promise<voi
     row => [row.id, row.code, row.name, row.quantity, row.sheetName, row.codeNorm, row.nameNorm]);
 }
 
+export async function searchCatalogSuggestions(
+  query: string,
+  field: 'code' | 'name',
+  limit = 8,
+): Promise<CatalogItem[]> {
+  const normalized = normalize(query);
+  if (!normalized) return [];
+  const target = field === 'code' ? 'code_norm' : 'name_norm';
+  if (Platform.OS === 'web') {
+    return getWebCatalog()
+      .filter(item => normalize(item[field]).startsWith(normalized))
+      .sort((a, b) => normalize(a[field]).localeCompare(normalize(b[field])))
+      .slice(0, limit);
+  }
+  const db = await getDb();
+  return db.getAllAsync<CatalogRow>(
+    `SELECT code, name, quantity, sheet_name AS sheetName FROM catalog WHERE ${target} LIKE ? ORDER BY ${target}, id LIMIT ?`,
+    `${normalized}%`, limit,
+  );
+}
+
+/** Loads a bounded page from the local catalog. Name filtering is accent-insensitive
+ * and supports text anywhere in the product description (e.g. "calca"). */
+export async function getCatalogPage(
+  query = '',
+  limit = 60,
+  offset = 0,
+): Promise<CatalogItem[]> {
+  const normalized = normalize(query);
+  const safeLimit = Math.max(1, Math.min(100, Math.floor(limit)));
+  const safeOffset = Math.max(0, Math.floor(offset));
+  if (Platform.OS === 'web') {
+    const items = getWebCatalog();
+    const filtered = normalized
+      ? items.filter(item => normalize(item.name).includes(normalized))
+      : items;
+    filtered.sort((a, b) => normalize(a.name).localeCompare(normalize(b.name)));
+    return filtered.slice(safeOffset, safeOffset + safeLimit);
+  }
+  const db = await getDb();
+  if (normalized) {
+    // Escaping prevents %, _ and \\ typed by the user from becoming SQL wildcards.
+    const escaped = normalized.replace(/[\\%_]/g, '\\$&');
+    return db.getAllAsync<CatalogRow>(
+      `SELECT code, name, quantity, sheet_name AS sheetName
+       FROM catalog WHERE name_norm LIKE ? ESCAPE '\\'
+       ORDER BY CASE WHEN name_norm LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END, name_norm, id
+       LIMIT ? OFFSET ?`,
+      `%${escaped}%`, `${escaped}%`, safeLimit, safeOffset,
+    );
+  }
+  return db.getAllAsync<CatalogRow>(
+    'SELECT code, name, quantity, sheet_name AS sheetName FROM catalog ORDER BY name_norm, id LIMIT ? OFFSET ?',
+    safeLimit, safeOffset,
+  );
+}
+
 export async function searchCatalogNames(query: string, limit = 8): Promise<CatalogItem[]> {
   const normalized = normalize(query);
   if (!normalized) return [];

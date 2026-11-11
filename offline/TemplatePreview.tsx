@@ -61,7 +61,8 @@ function PreviewShape({
     return <Image
       key={visual.id}
       source={{ uri: `data:${visual.imageMime || 'image/png'};base64,${visual.imageBase64}` }}
-      resizeMode="contain"
+      // Respect the source crop recorded by PowerPoint (e.g. the wide CKTR logo box).
+      resizeMode={visual.imageFit || 'contain'}
       style={baseStyle}
     />;
   }

@@ -5,7 +5,7 @@ Aplicativo Android/iOS para importar planilhas Excel, preparar plaquetas a parti
 ## O que funciona localmente
 
 - Importação de planilhas `.xlsx`, escolha da aba e mapeamento das colunas de código, descrição e quantidade. O arquivo é lido no aparelho.
-- Pesquisa por código/nome, sugestões e montagem da lista de plaquetas usando a base armazenada localmente.
+- Pesquisa por código/nome, sugestões por prefixo nos dois campos e montagem da lista de plaquetas usando a base armazenada localmente. A etapa Itens também exibe um catálogo pesquisável por trecho do nome, com código, seleção por caixas e carregamento paginado.
 - Modelo PowerPoint padrão incluído no próprio aplicativo; modelos personalizados são copiados para o armazenamento do app.
 - Prévia em tempo real do slide carregado, reconstruída a partir das formas, caixas de texto, linhas e imagens que o aplicativo consegue interpretar no PPTX.
 - Ajuste do texto de código ou nome por deslocamentos em milímetros: global para todas as posições do slide ou individual para uma posição da folha. Os ajustes são gravados no aparelho e usados na exportação.
@@ -32,6 +32,14 @@ O workflow `.github/workflows/build-native.yml` instala dependências e compila 
 2. Abra **Actions → Build Android and iOS**.
 3. Baixe `plaquetas-android-apk` para Android.
 4. O job `plaquetas-ios-simulator` gera um app para simulador, não para iPhone físico. Para um iPhone real, habilite `build_ios_ipa` e configure o certificado e perfil de provisionamento Apple descritos em `.github/workflows/README.md`.
+
+## Seleção de produtos (v4.4)
+
+Na etapa **Itens**, o app mostra os produtos da base local sem exigir uma busca inicial. A lista exibe apenas nome e código, com seleção por caixas. O campo de filtro procura termos em qualquer parte do nome e ignora diferenças entre letras acentuadas e sem acento (por exemplo, `calça` encontra `CALCA`). Os resultados são paginados em lotes de 60 para evitar carregar a base inteira na memória; use **Carregar mais produtos** para avançar. A seleção permanece marcada ao filtrar outros nomes e pode ser adicionada em lote às plaquetas.
+
+Os campos **Por nome** e **Por código** oferecem sugestões conforme os primeiros caracteres digitados. Tocar em uma sugestão preenche o campo com o nome ou código completo; depois, use **Adicionar à lista**. Também continua sendo possível colar vários valores separados por quebra de linha, vírgula ou ponto e vírgula.
+
+A prévia do PowerPoint respeita o modo de ajuste da imagem descrito no PPTX. Imagens com recorte definido pelo PowerPoint usam preenchimento com recorte, evitando que a imagem CKTR quadrada com grandes margens transparentes seja reduzida dentro da caixa horizontal do logotipo; imagens sem instrução de recorte continuam usando encaixe proporcional.
 
 ## Desenvolvimento
 
